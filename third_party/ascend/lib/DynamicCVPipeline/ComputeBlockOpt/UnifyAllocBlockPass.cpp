@@ -412,6 +412,28 @@ static bool tryUnifyForAlloc(memref::AllocOp allocOp, const CVPipeline::MemoryDe
     LOG_DEBUG("[needsSplitIf] SCF.IF need split " );
     fillInfo = splitSCFIfIfNeeded(fillInfo);
   }
+  // 新增一步骤：将scf.if的条件的定义的相关op也要收集起来做成环检测和最后修改block_id，要一直向上查找，找到底
+  SmallVector<Operation *> conditionOps;
+  SmallVector<Operation *> toProcess;
+
+  Value condition = fillInfo.parentIf.getCondition();
+  if (auto *condDefOp = condition.getDefiningOp()) {
+    toProcess.push_back(condDefOp);
+  }
+
+  while (!toProcess.empty()) {
+    auto *op = toProcess.pop_back_val();
+    if (llvm::is_contained(conditionOps, op)) {
+      continue;
+    }
+    conditionOps.push_back(op);
+
+    for (auto operand : op->getOperands()) {
+      if (auto *defOp = operand.getDefiningOp()) {
+        toProcess.push_back(defOp);
+      }
+    }
+  }
 
   // Step5: Cycle detection - check if unification would create cycle
   SmallVector<Operation *> opsToUnify = {
@@ -419,6 +441,7 @@ static bool tryUnifyForAlloc(memref::AllocOp allocOp, const CVPipeline::MemoryDe
       fillInfo.fillOp.getOperation(),
       fillInfo.parentIf.getOperation(),
   };
+  opsToUnify.append(conditionOps);
   if (willCreateCycle(opsToUnify, memGraph, *targetBlockId)) {
     LOG_DEBUG("[Cycle detection] Find cycle! Did not change block_id: "<< targetBlockId);
     return false;
@@ -431,6 +454,9 @@ static bool tryUnifyForAlloc(memref::AllocOp allocOp, const CVPipeline::MemoryDe
   markOpBlockId(allocOp, *targetBlockId);
   markOpBlockId(fillInfo.fillOp, *targetBlockId);
   markOpBlockId(fillInfo.parentIf, *targetBlockId);
+  for (auto *condOp : conditionOps) {
+    markOpBlockId(condOp, *targetBlockId);
+  }
   return true;
 }
 
