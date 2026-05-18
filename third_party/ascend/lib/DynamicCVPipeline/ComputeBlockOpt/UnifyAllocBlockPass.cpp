@@ -63,6 +63,18 @@ struct CycleDfs {
       : block(block), memGraph(memGraph), okSet(okSet) {}
 };
 
+
+static std::optional<int> lookupOpBlockId(Operation *op) {
+    if (auto attr = op->getAttrOfType<IntegerAttr>("ssbuffer.block_id"))
+        return attr.getInt();
+    return -1;
+}
+
+static void setOpBlockId(Operation *op, int blockId) {
+    auto &bm = CVPipeline::ComputeBlockIdManager::getInstance();
+    bm.updateBlockId(op, blockId);
+}
+
 bool CycleDfs::operator()(Operation *cur) {
   if (okSet.contains(cur)) {
     return true;
@@ -133,6 +145,13 @@ static bool willCreateCycle(ArrayRef<Operation *> opsToUnify,
     okSet.insert(op);
   }
 
+  DenseMap<Operation *, int> origBlockIdMap;
+  for (auto *op : opsToUnify) {
+    auto optBlockId = lookupOpBlockId(op);
+    origBlockIdMap[op] = optBlockId.value_or(-1);
+    setOpBlockId(op, targetBlockId);
+  }
+
   CycleDfs dfs(block, memGraph, okSet);
   bool hasCycle = false;
 
@@ -171,18 +190,15 @@ static bool willCreateCycle(ArrayRef<Operation *> opsToUnify,
     }
   }
 
+  for (auto &[op, origBlockId] : origBlockIdMap) {
+    if (origBlockId == -1) {
+      op->removeAttr("ssbuffer.block_id");
+    } else {
+      setOpBlockId(op, origBlockId);
+    }
+  }
+
   return hasCycle;
-}
-
-static std::optional<int> lookupOpBlockId(Operation *op) {
-    if (auto attr = op->getAttrOfType<IntegerAttr>("ssbuffer.block_id"))
-        return attr.getInt();
-    return -1;
-}
-
-static void markOpBlockId(Operation *op, int blockId) {
-    auto &bm = CVPipeline::ComputeBlockIdManager::getInstance();
-    bm.updateBlockId(op, blockId);
 }
 
 /**
@@ -412,13 +428,16 @@ static bool tryUnifyForAlloc(memref::AllocOp allocOp, const CVPipeline::MemoryDe
     LOG_DEBUG("[needsSplitIf] SCF.IF need split " );
     fillInfo = splitSCFIfIfNeeded(fillInfo);
   }
-  // 新增一步骤：将scf.if的条件的定义的相关op也要收集起来做成环检测和最后修改block_id，要一直向上查找，找到底
+
   SmallVector<Operation *> conditionOps;
   SmallVector<Operation *> toProcess;
 
   Value condition = fillInfo.parentIf.getCondition();
+  Block *block = fillInfo.parentIf->getBlock();
   if (auto *condDefOp = condition.getDefiningOp()) {
-    toProcess.push_back(condDefOp);
+    if (auto *ancestorInBlock = CVPipeline::getAncestorInBlock(condDefOp, block)) {
+      toProcess.push_back(ancestorInBlock);
+    }
   }
 
   while (!toProcess.empty()) {
@@ -430,7 +449,9 @@ static bool tryUnifyForAlloc(memref::AllocOp allocOp, const CVPipeline::MemoryDe
 
     for (auto operand : op->getOperands()) {
       if (auto *defOp = operand.getDefiningOp()) {
-        toProcess.push_back(defOp);
+        if (auto *ancestorInBlock = CVPipeline::getAncestorInBlock(defOp, block)) {
+          toProcess.push_back(ancestorInBlock);
+        }
       }
     }
   }
@@ -451,11 +472,11 @@ static bool tryUnifyForAlloc(memref::AllocOp allocOp, const CVPipeline::MemoryDe
   LOG_DEBUG("[tryUnifyForAlloc] Unifying block_id to " << *targetBlockId << " for:");
   LOG_DEBUG("  - alloc: " << *allocOp.getOperation());
   LOG_DEBUG("  - fillOp: " << *fillInfo.fillOp.getOperation());
-  markOpBlockId(allocOp, *targetBlockId);
-  markOpBlockId(fillInfo.fillOp, *targetBlockId);
-  markOpBlockId(fillInfo.parentIf, *targetBlockId);
+  setOpBlockId(allocOp, *targetBlockId);
+  setOpBlockId(fillInfo.fillOp, *targetBlockId);
+  setOpBlockId(fillInfo.parentIf, *targetBlockId);
   for (auto *condOp : conditionOps) {
-    markOpBlockId(condOp, *targetBlockId);
+    setOpBlockId(condOp, *targetBlockId);
   }
   return true;
 }
@@ -505,7 +526,7 @@ static void processCopyOp(memref::CopyOp copyOp,
     }
     for (auto [op, blockId] : opsToMark) {
       LOG_DEBUG("[CopyOp Cycle] Would not create cycle for copyOp, skipping");
-      markOpBlockId(op, blockId);
+      setOpBlockId(op, blockId);
     }
 }
 
