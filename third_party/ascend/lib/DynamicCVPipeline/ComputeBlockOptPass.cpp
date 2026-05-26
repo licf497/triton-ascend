@@ -68,6 +68,7 @@ void registerComputeBlockOptPasses()
 {
     registerPass([]() -> std::unique_ptr<mlir::Pass> { return createComputeBlockOptPass(); });
     registerPass(createUBUsageOptPass);
+    registerPass(createUnifyAllocBlockPass);
     registerPass(createFuseAdotBaddCPass);
     registerPass(createUnifyAllocBlockPass);
 }
