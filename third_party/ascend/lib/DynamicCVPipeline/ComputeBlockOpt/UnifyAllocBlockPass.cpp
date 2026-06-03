@@ -545,6 +545,116 @@ static LogicalResult tryUnifyForAlloc(memref::AllocOp allocOp,
   return success();
 }
 
+static bool hasNestedSCFIf(scf::IfOp ifOp) {
+  for (auto &region : ifOp->getRegions()) {
+    if (region.empty()) continue;
+    for (auto &op : region.front().without_terminator()) {
+      if (isa<scf::IfOp>(&op)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool isAllVectorOps(scf::IfOp ifOp) {
+  for (auto &region : ifOp->getRegions()) {
+    if (region.empty()) continue;
+    for (auto &op : region.front().without_terminator()) {
+      auto coreTypeAttr = op.getAttrOfType<StringAttr>(CVPipeline::kCoreType);
+      if (!coreTypeAttr || coreTypeAttr.getValue() != "VECTOR") {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static SmallVector<Operation *> collectInnerOps(scf::IfOp ifOp) {
+  SmallVector<Operation *> innerOps;
+  for (auto &region : ifOp->getRegions()) {
+    if (region.empty()) continue;
+    for (auto &op : region.front().without_terminator()) {
+      innerOps.push_back(&op);
+    }
+  }
+  return innerOps;
+}
+
+static LogicalResult tryUnifyForSCFIf(scf::IfOp ifOp,
+                                      const CVPipeline::MemoryDependenceGraph &memGraph,
+                                      CVPipeline::ComputeBlockIdManager &bm) {
+  LOG_DEBUG("[tryUnifyForSCFIf] start from scf.if: " << *ifOp);
+
+  if (hasNestedSCFIf(ifOp)) {
+    LOG_DEBUG("[tryUnifyForSCFIf] skip: has nested scf.if");
+    return success();
+  }
+
+  if (!isAllVectorOps(ifOp)) {
+    LOG_DEBUG("[tryUnifyForSCFIf] skip: not all inner ops are VECTOR");
+    return success();
+  }
+
+  Value cond = ifOp.getCondition();
+  auto *condDefOp = cond.getDefiningOp();
+  if (!condDefOp) {
+    LOG_DEBUG("[tryUnifyForSCFIf] skip: condition is BlockArgument");
+    return success();
+  }
+
+  auto condBlockId = CVPipeline::getOpBlockId(condDefOp);
+  if (!condBlockId) {
+    LOG_DEBUG("[tryUnifyForSCFIf] skip: condition definingOp has no block_id");
+    return success();
+  }
+
+  int targetBlockId = static_cast<int>(*condBlockId);
+  LOG_DEBUG("[tryUnifyForSCFIf] targetBlockId = " << targetBlockId);
+
+  SmallVector<Operation *> coreOps;
+  coreOps.push_back(ifOp.getOperation());
+  auto innerOps = collectInnerOps(ifOp);
+  coreOps.append(innerOps);
+
+  SmallVector<Operation *> predOps;
+  if (auto *ancestorInBlock = CVPipeline::getAncestorInBlock(condDefOp, ifOp->getBlock())) {
+    predOps.push_back(ancestorInBlock);
+  }
+
+  SmallVector<Operation *> baseOps;
+  baseOps.append(coreOps);
+  baseOps.append(predOps);
+
+  auto users = ifOp->getUsers();
+  SmallVector<Operation *> userList(users.begin(), users.end());
+  llvm::sort(userList, [](Operation *a, Operation *b) {
+    return a->isBeforeInBlock(b);
+  });
+  if (userList.empty()) {
+    LOG_DEBUG("[tryUnifyForSCFIf] skip: scf.if has no users");
+    return success();
+  }
+
+  for (auto *user : userList) {
+    SmallVector<Operation *> candidate;
+    candidate.append(baseOps);
+    candidate.push_back(user);
+
+    if (!willCreateCycle(candidate, memGraph, targetBlockId, bm)) {
+      LOG_DEBUG("[tryUnifyForSCFIf] unified with user: " << *user);
+      for (auto *op : candidate) {
+        bm.updateBlockId(op, targetBlockId);
+      }
+      return success();
+    }
+    LOG_DEBUG("[tryUnifyForSCFIf] user causes cycle, trying next: " << *user);
+  }
+
+  LOG_DEBUG("[tryUnifyForSCFIf] all users cause cycle, skip this scf.if");
+  return success();
+}
+
 } // anonymous namespace
 
 
@@ -577,6 +687,17 @@ public:
     
     for (memref::AllocOp allocOp: allocOps) {
       if (failed(tryUnifyForAlloc(allocOp, memGraph, bm))) {
+        signalPassFailure();
+      }
+    }
+
+    llvm::SmallVector<scf::IfOp> ifOps;
+    module.walk([&](scf::IfOp ifOp) {
+      ifOps.push_back(ifOp);
+    });
+
+    for (scf::IfOp ifOp : ifOps) {
+      if (failed(tryUnifyForSCFIf(ifOp, memGraph, bm))) {
         signalPassFailure();
       }
     }
