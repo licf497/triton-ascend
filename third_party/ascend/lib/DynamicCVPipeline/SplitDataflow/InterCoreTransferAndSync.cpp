@@ -1070,12 +1070,6 @@ LogicalResult InterCoreTransferAndSyncPass::handleCubeToVector(OpBuilder &builde
     LOG_DEBUG("[newProdEnd]" << *prodEnd << "\n");
     LOG_DEBUG("[newConsStart]" << *consStart << "\n");
     LOG_DEBUG("[newConsEnd]" << *consEnd << "\n");
-
-    if (dep.consumerBlockId == dep.iniConsumerBlockId) {
-        auto consumerPoint = analyzeConsumerReadInsertPoint(srcValue, dep.iniConsumerBlockId);
-        consStart = consumerPoint;
-    }
-
     Operation *consumedDataOp = nullptr;
     Operation *transferOp =
         insertCubeToVectorTransfer(builder, srcValue, prodEnd, consStart, loc, transferIndex, dep.iniConsumerBlockId,
@@ -1083,12 +1077,6 @@ LogicalResult InterCoreTransferAndSyncPass::handleCubeToVector(OpBuilder &builde
 
     auto [newProdStart, newProdEnd] = getBlockStartEnd(dep.producerBlockId, module); // C Block
     auto [newConsStart, newConsEnd] = getBlockStartEnd(dep.consumerBlockId, module); // V Block
-
-    if (dep.consumerBlockId == dep.iniConsumerBlockId) {
-        auto newconsumerPoint = getConsumerWaitPoint(transferIndex);
-        newConsStart = newconsumerPoint;
-    }
-
     int flagId = flagManager.acquireId(newProdStart);
     insertInterCoreSync(builder, transferOp, newConsStart, newConsEnd, flagId, loc, transferIndex, flagIdReuseManager,
         consumedDataOp);
