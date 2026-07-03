@@ -56,6 +56,25 @@ bool willCreateCycle(llvm::ArrayRef<Operation *> opsToUnify,
                      const MemoryDependenceGraph &memGraph, int targetBlockId,
                      ComputeBlockIdManager &bm);
 
+/**
+ * @brief Clone scalar-producing ops shared between a fixpipe pattern and other
+ * blocks
+ *
+ * Walks the pattern's scalar-producing ops in reverse topological order. If
+ * such an op's result is used by an op that is outside both the pattern and
+ * the matmul's original block, clones the op and redirects those external uses
+ * to the clone, keeping the original for pattern-internal use. This prevents
+ * the cross-block dependency cycle that would otherwise appear after the
+ * fixpipe fusion moves the pattern ops into the matmul's block_id.
+ *
+ * @param bmOriginal "Original" block_id view (before any fusion happens in the
+ *                   caller); used to decide whether a user is in a different
+ *                   block than the matmul (matchedOps[0]).
+ * @param matchedOps The op set of one fixpipe pattern (matmul first).
+ */
+void cloneScalarOpsForCrossBlockUses(ComputeBlockIdManager &bmOriginal,
+                                     SetVector<Operation *> &matchedOps);
+
 } // namespace CVPipeline
 } // namespace mlir
 
