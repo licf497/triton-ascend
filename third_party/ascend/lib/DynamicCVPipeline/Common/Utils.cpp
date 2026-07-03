@@ -10,6 +10,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Operation.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
@@ -111,6 +112,33 @@ bool isVectorOnlyOp(Operation *op)
         .Case<arith::SelectOp, math::FloorOp>(
             [](Operation *op) { return isa<RankedTensorType>(op->getResult(0).getType()); })
         .Default([](auto) { return false; });
+}
+
+bool isScalarLike(Value value)
+{
+    Type type = value.getType();
+    auto shapedType = dyn_cast<ShapedType>(type);
+
+    // 1. true scalar (int / index / float)
+    if (!shapedType) {
+        return type.isIntOrIndexOrFloat();
+    }
+
+    // 2. tensor with empty shape (e.g. tensor<f32>)
+    ArrayRef<int64_t> shape = shapedType.getShape();
+    if (shape.empty()) {
+        return true;
+    }
+
+    // 3. splat constant tensor (all elements identical)
+    Attribute attr;
+    if (matchPattern(value, m_Constant(&attr))) {
+        auto denseAttr = dyn_cast<DenseIntOrFPElementsAttr>(attr);
+        return denseAttr && denseAttr.isSplat() && denseAttr.getElementType().isIntOrIndexOrFloat();
+    }
+
+    // 4. single-element tensor (all dims == 1)
+    return llvm::all_of(shape, [](int64_t dim) { return dim == 1; });
 }
 
 bool isScfOp(Operation *op)
