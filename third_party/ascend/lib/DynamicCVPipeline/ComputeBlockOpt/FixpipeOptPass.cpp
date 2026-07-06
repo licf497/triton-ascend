@@ -223,42 +223,9 @@ bool FixpipeOptPass::isValidTrunc(Operation *op)
     return false;
 }
 
-/** Determines if a value is "scalar-like" based on the following criteria:
- 1. True scalar types (integer, index, or float)
- 2. Tensor types with empty shape (e.g., tensor<f32>)
- 3. Constant tensors where all elements have the same value (splat constants)
- 4. Tensors with shape where all dimensions equal 1 (single-element tensors)
- */
-static bool isScalarLike(Value value)
-{
-    Type type = value.getType();
-    auto shapedType = dyn_cast<ShapedType>(type);
-
-    // 1. scalar
-    if (!shapedType) {
-        return type.isIntOrIndexOrFloat();
-    }
-
-    // 2. tensor<f32> with empty shape is also considered scalar-like
-    ArrayRef<int64_t> shape = shapedType.getShape();
-    if (shape.empty()) {
-        return true;
-    }
-
-    // 3. tensor with constant value
-    Attribute attr;
-    if (matchPattern(value, m_Constant(&attr))) {
-        auto denseAttr = dyn_cast<DenseIntOrFPElementsAttr>(attr);
-        return denseAttr && denseAttr.isSplat() && denseAttr.getElementType().isIntOrIndexOrFloat();
-    }
-
-    // 4. tensor with one element
-    return llvm::all_of(shape, [](int64_t dim) { return dim == 1; });
-}
-
 void transSource(Value value, SetVector<Operation *> &matchedOps, Block *block)
 {
-    if (!isScalarLike(value)) {
+    if (!CVPipeline::isScalarLike(value)) {
         return;
     }
 
@@ -305,7 +272,7 @@ bool FixpipeOptPass::isValidMul(Operation *op, Value matmulValue, SetVector<Oper
         return false;
     }
     auto quantScalarValue = op->getOperand(0) == matmulValue ? op->getOperand(1) : op->getOperand(0);
-    if (isScalarLike(quantScalarValue)) {
+    if (CVPipeline::isScalarLike(quantScalarValue)) {
         transSource(quantScalarValue, matchedOps, op->getBlock());
         return true;
     }
@@ -316,7 +283,7 @@ bool FixpipeOptPass::isValidMul(Operation *op, Value matmulValue, SetVector<Oper
             auto operands = fillOp->getOperands();
             if (!operands.empty()) {
                 Value fillValue = operands[0];
-                if (isScalarLike(fillValue)) {
+                if (CVPipeline::isScalarLike(fillValue)) {
                     if (llvm::find(matchedOps, fillOp) == matchedOps.end() && fillOp.getBlock() == op->getBlock()) {
                         matchedOps.insert(fillOp);
                     }
@@ -600,7 +567,7 @@ void FixpipeOptPass::runOnOperation()
     for (auto &matchedOps : allMatchedPatterns) {
         auto sorted = mlir::multiRootTopologicalSort(matchedOps);
         for (Operation *op : llvm::reverse(sorted)) {
-            if (op->getNumResults() == 1 && isScalarLike(op->getResult(0))) {
+            if (op->getNumResults() == 1 && CVPipeline::isScalarLike(op->getResult(0))) {
                 // replace op not in matchedOps with cloned op, and keep original op for other pattern.
                 SmallVector<OpOperand *> otherUses;
                 for (auto &use : op->getResult(0).getUses()) {

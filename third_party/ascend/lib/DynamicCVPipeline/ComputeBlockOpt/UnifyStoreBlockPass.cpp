@@ -50,42 +50,6 @@ using namespace triton;
 
 namespace {
 
-/**
- * @brief Check whether a value is "scalar-like".
- *
- * A value is scalar-like if it is:
- *   1. a true scalar (Int/Index/Float);
- *   2. a tensor with empty shape (e.g. tensor<f32>);
- *   3. a splat constant tensor;
- *   4. a single-element tensor (all dims == 1).
- */
-static bool isScalarLike(Value value)
-{
-    Type type = value.getType();
-    auto shapedType = dyn_cast<ShapedType>(type);
-
-    // 1. true scalar (int / index / float)
-    if (!shapedType) {
-        return type.isIntOrIndexOrFloat();
-    }
-
-    // 2. tensor with empty shape (e.g. tensor<f32>)
-    ArrayRef<int64_t> shape = shapedType.getShape();
-    if (shape.empty()) {
-        return true;
-    }
-
-    // 3. splat constant tensor (all elements identical)
-    Attribute attr;
-    if (matchPattern(value, m_Constant(&attr))) {
-        auto denseAttr = dyn_cast<DenseIntOrFPElementsAttr>(attr);
-        return denseAttr && denseAttr.isSplat() && denseAttr.getElementType().isIntOrIndexOrFloat();
-    }
-
-    // 4. single-element tensor (all dims == 1)
-    return llvm::all_of(shape, [](int64_t dim) { return dim == 1; });
-}
-
 static bool isStoreOp(Operation *op)
 {
     return isa<bufferization::MaterializeInDestinationOp>(op) || isa<hivm::StoreOp>(op);
@@ -129,10 +93,10 @@ static Value getViewSourceValue(Operation *viewOp)
     return Value();
 }
 
-static Operation *traceProducerOp(Value startValue, SmallVector<Operation *> &dataViewOps)
+static Operation *traceProducerOp(Operation *storeOp, SmallVector<Operation *> &dataViewOps)
 {
     SmallPtrSet<Operation *, 16> visited;
-    Value cur = startValue;
+    Value cur = getStoreSource(storeOp);
     while (Operation *defOp = cur.getDefiningOp()) {
         // view-like op (incl. tensor.extract_slice): transparent, pierce through
         if (isViewLikeOp(defOp)) {
@@ -140,16 +104,13 @@ static Operation *traceProducerOp(Value startValue, SmallVector<Operation *> &da
             cur = getViewSourceValue(defOp);
             continue;
         }
-        // scalar-producing op: skip, continue along its first (data) operand
-        if (defOp->getNumResults() > 0 && isScalarLike(defOp->getResult(0))) {
-            if (defOp->getNumOperands() == 0) {
-                return nullptr; // scalar chain ends without a real producer
-            }
-            cur = defOp->getOperand(0);
-            continue;
+        // scalar-producing op: skip
+        if (CVPipeline::isScalarLike(cur)) {
+            return nullptr; // producer is a scalar-like op
+
         }
-        // hit: a real compute op; only unifiable if it's VECTOR_ONLY
-        if (CVPipeline::getOpCoreType(defOp) != CVPipeline::CoreType::VECTOR_ONLY) {
+        // hit: a real compute op; only unifiable if it has the same core type as storeOp
+        if (CVPipeline::getOpCoreType(defOp) != CVPipeline::getOpCoreType(storeOp)) {
             LOG_DEBUG("Producer op is not VECTOR_ONLY: " << *defOp);
             return nullptr;
         }
@@ -166,17 +127,13 @@ static Operation *traceProducerOp(Value startValue, SmallVector<Operation *> &da
  * Only view ops whose current block_id equals storeBlockId are appended to
  * @p ops (per design §5.1 block_id filter rule).
  */
-static void collectViewOpsToUnify(SmallVector<Operation *> &ops, Operation *storeOp,
-                                  int storeBlockId,
+static void collectViewOpsToUnify(SmallVector<Operation *> &ops, Operation *storeOp, 
                                   const SmallVector<Operation *> &dataViewOps,
-                                  CVPipeline::ComputeBlockIdManager &bm)
+                                  CVPipeline::ComputeBlockIdManager &bm,
+                                  SmallPtrSet<Operation *, 16> &seen)
 {
-    SmallPtrSet<Operation *, 16> seen;
-    for (Operation *op : ops) {
-        seen.insert(op);
-    }
     auto addIfMatch = [&](Operation *op) {
-        if (bm.getBlockIdByOp(op) == storeBlockId && seen.insert(op).second) {
+        if (bm.getBlockIdByOp(op) == bm.getBlockIdByOp(storeOp) && seen.insert(op).second) {
             ops.push_back(op);
         }
     };
@@ -186,7 +143,7 @@ static void collectViewOpsToUnify(SmallVector<Operation *> &ops, Operation *stor
     }
 
     // dest-chain view ops: walk up the dest memref's view chain and unify each
-    // view op whose block_id matches storeBlockId.
+    // view op whose block_id matches storeOp's block_id.
     Value cur = getStoreDest(storeOp);
     while (Operation *defOp = cur.getDefiningOp()) {
         if (!isViewLikeOp(defOp)) {
@@ -206,19 +163,15 @@ static void collectViewOpsToUnify(SmallVector<Operation *> &ops, Operation *stor
  * skipped. The defining op itself is collected (no getAncestorInBlock folding),
  * so scalars defined in outer blocks are also unified.
  */
-static void collectScalarDeps(SmallVector<Operation *> &ops, int storeBlockId,
-                              Operation *storeOp, CVPipeline::ComputeBlockIdManager &bm)
+static void collectScalarDeps(SmallVector<Operation *> &ops, Operation *storeOp, 
+                              CVPipeline::ComputeBlockIdManager &bm,
+                              SmallPtrSet<Operation *, 16> &seen)
 {
-    SmallPtrSet<Operation *, 16> seen;
-    for (Operation *op : ops) {
-        seen.insert(op);
-    }
-
     SmallVector<Operation *> worklist(ops.begin(), ops.end());
 
     for (Operation *p = storeOp->getParentOp(); p && !isa<ModuleOp>(p);
          p = p->getParentOp()) {
-        if (isa<scf::ForOp, scf::IfOp, scf::WhileOp, scf::IndexSwitchOp>(p)) {
+        if (isa<LoopLikeOpInterface>(p) || isa<scf::IfOp>(p)) {
             worklist.push_back(p);
         }
     }
@@ -228,7 +181,7 @@ static void collectScalarDeps(SmallVector<Operation *> &ops, int storeBlockId,
         for (Value operand : cur->getOperands()) {
             // only scalar-like operands are collected; non-scalar operands
             // belong to data/dest chains or external blocks
-            if (!isScalarLike(operand)) {
+            if (!CVPipeline::isScalarLike(operand)) {
                 continue;
             }
             Operation *defOp = operand.getDefiningOp();
@@ -236,7 +189,8 @@ static void collectScalarDeps(SmallVector<Operation *> &ops, int storeBlockId,
                 continue; // block argument, no block_id to change
             }
             // only collect scalar ops whose block_id matches the store's
-            if (bm.getBlockIdByOp(defOp) != storeBlockId || !seen.insert(defOp).second) {
+            if (bm.getBlockIdByOp(defOp) != bm.getBlockIdByOp(storeOp) || 
+                !seen.insert(defOp).second) {
                 continue;
             }
             ops.push_back(defOp);
@@ -251,15 +205,18 @@ static void collectScalarDeps(SmallVector<Operation *> &ops, int storeBlockId,
  * opsToUnify = {store} + viewOps (data + dest, block_id filtered) +
  *              scalarDeps (recursively collected, block_id filtered).
  */
-static SmallVector<Operation *> collectOpsToUnify(Operation *storeOp, int storeBlockId,
+static SmallVector<Operation *> collectOpsToUnify(Operation *storeOp, 
                                                   const SmallVector<Operation *> &dataViewOps,
                                                   CVPipeline::ComputeBlockIdManager &bm)
 {
     SmallVector<Operation *> opsToUnify;
     opsToUnify.push_back(storeOp);
 
-    collectViewOpsToUnify(opsToUnify, storeOp, storeBlockId, dataViewOps, bm);
-    collectScalarDeps(opsToUnify, storeBlockId, storeOp, bm);
+    SmallPtrSet<Operation *, 16> seen;
+    seen.insert(storeOp);
+
+    collectViewOpsToUnify(opsToUnify, storeOp, dataViewOps, bm, seen);
+    collectScalarDeps(opsToUnify, storeOp, bm, seen);
 
     for (Operation *op : opsToUnify) {
         LOG_DEBUG("opToUnify: " << *op);
@@ -281,19 +238,19 @@ static LogicalResult tryUnifyForStore(Operation *storeOp,
     // Step 1: trace producer op from store.source, skipping views + scalars,
     //         and collect all viewops in the data chain.
     SmallVector<Operation *> dataViewOps;
-    Operation *producer = traceProducerOp(getStoreSource(storeOp), dataViewOps);
+    Operation *producer = traceProducerOp(storeOp, dataViewOps);
     if (!producer) {
-        return success(); // block argument / fully-scalar chain / non-VECTOR_ONLY -> skip
+        return success(); // block argument / fully-scalar chain / core_type mismatch -> skip
     }
 
     int targetBlockId = bm.getBlockIdByOp(producer);
-    if (targetBlockId == -1) {
+    if (targetBlockId == -1 || targetBlockId == storeBlockId) {
+        LOG_DEBUG("ProducerOp has no block_id, or block_id is the same as storeOp's, no need to unify");
         return success(); // producer has no block_id, cannot unify
     }
 
     // Step 2: build opsToUnify = {store} + viewOps + scalarDeps.
-    SmallVector<Operation *> opsToUnify =
-        collectOpsToUnify(storeOp, storeBlockId, dataViewOps, bm);
+    SmallVector<Operation *> opsToUnify = collectOpsToUnify(storeOp, dataViewOps, bm);
 
     // Step 3: cycle detection. On cycle, fail (no fallback per design §6).
     if (CVPipeline::willCreateCycle(opsToUnify, memGraph, targetBlockId, bm)) {
@@ -334,10 +291,12 @@ class UnifyStoreBlockPass : public PassWrapper<UnifyStoreBlockPass, OperationPas
         auto bm = CVPipeline::ComputeBlockIdManager(module);
 
         // Step 1: collect all store-semantic ops (MaterializeInDestinationOp,
-        //         hivm::StoreOp) in program order.
+        //         hivm::StoreOp) in program order. Only VECTOR-core stores are
+        //         candidates (CUBE-core stores are not unified here).
         SmallVector<Operation *> storeOps;
         module.walk([&](Operation *op) {
-            if (isStoreOp(op)) {
+            if (isStoreOp(op) &&
+                CVPipeline::getOpCoreType(op) == CVPipeline::CoreType::VECTOR_ONLY) {
                 storeOps.push_back(op);
             }
         });
