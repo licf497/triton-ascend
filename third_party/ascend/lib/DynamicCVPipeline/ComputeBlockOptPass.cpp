@@ -42,8 +42,8 @@ void ComputeBlockOptPass::runOnOperation()
         First, perform UnifyAllocBlock to merge load semantic operations into a unified block.
         Then, use UBUsageOpt to find the smallest UB dependency location and divide the computation blocks.
      */
-    pm.addPass(createUnifyAllocBlockPass());
-    pm.addPass(createReorderOpsByBlockIdPass());
+    // pm.addPass(createUnifyAllocBlockPass());
+    // pm.addPass(createReorderOpsByBlockIdPass());
 
     pm.addPass(createMergeVectorIfBlockPass());
     pm.addPass(createReorderOpsByBlockIdPass());

@@ -373,3 +373,4 @@ void registerUnifyAllocBlockPass() {
 
 } // namespace triton
 } // namespace mlir
+// test_c
