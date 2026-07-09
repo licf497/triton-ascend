@@ -268,8 +268,8 @@ SmallVector<int64_t> InterCoreTransferAndSyncPass::computeExpectedShape(
   if (isOnlyDepInMatmul) {
     if ((isMatmulA && newN != N) || (isMatmulB && newM != M)) {
       LOG_DEBUG("nd2nz shape is unaligned and matmul A/B is from cube");
-      CVPipeline::setFallbackAttr(module);
-      signalPassFailure();
+      CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_IGNORED);
+      return {};
     }
   }
 
@@ -405,8 +405,8 @@ void InterCoreTransferAndSyncPass::extractMatmulResult(
   mlir::Operation *paddingAccOp = linalgFillOp;
   if (!matmulCIsEmpty(acc)) {
     LOG_DEBUG("nd2nz shape is unaligned and matmul C is not empty");
-    CVPipeline::setFallbackAttr(module);
-    signalPassFailure();
+    CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_IGNORED);
+    return;
   }
 
   Value newAccResult = paddingAccOp->getResult(0);

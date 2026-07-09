@@ -1588,7 +1588,7 @@ void OpClassifierPass::runOnOperation() {
   // Step 3: Penetrate CUBE coloring into pure loader for-loops.
   if (CVPipeline::isCubeBlockMergeEnabled() &&
       penetrateCubeIntoForLoops() != 0) {
-    signalPassFailure();
+    CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
     return;
   }
 
