@@ -22,6 +22,7 @@
  
 #include <optional>
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Common.h"
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
@@ -565,30 +566,7 @@ void FixpipeOptPass::runOnOperation()
     */
     auto bmOriginal = CVPipeline::ComputeBlockIdManager(module);
     for (auto &matchedOps : allMatchedPatterns) {
-        auto sorted = mlir::multiRootTopologicalSort(matchedOps);
-        for (Operation *op : llvm::reverse(sorted)) {
-            if (op->getNumResults() == 1 && CVPipeline::isScalarLike(op->getResult(0))) {
-                // replace op not in matchedOps with cloned op, and keep original op for other pattern.
-                SmallVector<OpOperand *> otherUses;
-                for (auto &use : op->getResult(0).getUses()) {
-                    Operation *userOp = use.getOwner();
-                    auto userInBlock = CVPipeline::getAncestorInBlock(userOp, op->getBlock());
-                    if (llvm::find(matchedOps, userInBlock) == matchedOps.end() &&
-                        bmOriginal.getBlockIdByOp(userInBlock) != bmOriginal.getBlockIdByOp(matchedOps[0]))
-                    {
-                        otherUses.push_back(&use);
-                    }
-                }
-                if (otherUses.size() > 0) {
-                    LOG_DEBUG("now cloned: " << *op << "\n");
-                    OpBuilder builder(op);
-                    auto clonedOp = builder.clone(*op);
-                    for (auto use : otherUses) {
-                        (*use).set(clonedOp->getResult(0));
-                    }
-                }
-            }
-        }
+        CVPipeline::cloneScalarOpsForCrossBlockUses(bmOriginal, matchedOps);
     }
 
     auto bm = CVPipeline::ComputeBlockIdManager(module);
