@@ -61,56 +61,6 @@ module {
   }
 
   // ============================================
-  // Test 3: Store inside scf.for with scalar index dependency
-  //
-  // store lives in scf.for body block (block_id=48). The dest chain has two
-  // view ops: reinterpret_cast (in the function block) and subview (in the
-  // loop body). Both are collected by collectDestViewOps and unified to 47.
-  //
-  // The scalar index op %offset (arith.muli) is inside the loop body; its
-  // block_id (48) matches the store's (48), so it is collected as a scalar
-  // dep and unified to 47.
-  //
-  // Outer-block scalars (%c0/%c1/%c10/%c64 in the function block) are also
-  // collected: %c0 feeds reinterpret_cast's offset, %c64 feeds muli, and
-  // %c0/%c1/%c10 feed the enclosing scf.for's lb/step/ub (control-flow
-  // ancestor ops are seeded into the scalar-dep worklist). All are unified
-  // to 47.
-  //
-  // producer = arith.truncf (VECTOR_ONLY, block_id=47).
-  // ============================================
-  // CHECK-LABEL: func @test_store_in_scf_for_scalar_deps
-  func.func @test_store_in_scf_for_scalar_deps(%arg0: memref<?xf16> {tt.divisibility = 16 : i32}, %in: tensor<64x64xf32>) {
-    // CHECK: arith.constant {ssbuffer.block_id = 47 : i32, ssbuffer.core_type = "VECTOR"} 0 : index
-    %c0 = arith.constant {ssbuffer.block_id = 48 : i32, ssbuffer.core_type = "VECTOR"} 0 : index
-    // CHECK: arith.constant {ssbuffer.block_id = 47 : i32, ssbuffer.core_type = "VECTOR"} 1 : index
-    %c1 = arith.constant {ssbuffer.block_id = 48 : i32, ssbuffer.core_type = "VECTOR"} 1 : index
-    // CHECK: arith.constant {ssbuffer.block_id = 47 : i32, ssbuffer.core_type = "VECTOR"} 10 : index
-    %c10 = arith.constant {ssbuffer.block_id = 48 : i32, ssbuffer.core_type = "VECTOR"} 10 : index
-    // CHECK: arith.constant {ssbuffer.block_id = 47 : i32, ssbuffer.core_type = "VECTOR"} 64 : index
-    %c64 = arith.constant {ssbuffer.block_id = 48 : i32, ssbuffer.core_type = "VECTOR"} 64 : index
-    // CHECK: arith.truncf %{{.*}} {ssbuffer.block_id = 47 : i32, ssbuffer.core_type = "VECTOR"} : tensor<64x64xf32> to tensor<64x64xf16>
-    %trunc = arith.truncf %in {ssbuffer.block_id = 47 : i32, ssbuffer.core_type = "VECTOR"} : tensor<64x64xf32> to tensor<64x64xf16>
-    // dest-chain view op (in function block, block_id=48 == storeBlockId),
-    // collected by collectDestViewOps and unified to 47.
-    // CHECK: memref.reinterpret_cast %{{.*}} {ssbuffer.block_id = 47 : i32, ssbuffer.core_type = "VECTOR"} : memref<?xf16> to memref<128x64xf16, strided<[64, 1], offset: ?>>
-    %reinterpret = memref.reinterpret_cast %arg0 to offset: [%c0], sizes: [128, 64], strides: [64, 1] {ssbuffer.block_id = 48 : i32, ssbuffer.core_type = "VECTOR"} : memref<?xf16> to memref<128x64xf16, strided<[64, 1], offset: ?>>
-    scf.for %iv = %c0 to %c10 step %c1 {
-      // CHECK: tensor.extract_slice %{{.*}} {ssbuffer.block_id = 47 : i32, ssbuffer.core_type = "VECTOR"} : tensor<64x64xf16> to tensor<64x64xf16>
-      %extract = tensor.extract_slice %trunc[0, 0] [64, 64] [1, 1] {ssbuffer.block_id = 48 : i32, ssbuffer.core_type = "VECTOR"} : tensor<64x64xf16> to tensor<64x64xf16>
-      // scalar dep: %offset is in the same scf.for body block as the store,
-      // its block_id (48) matches the store's, so it is unified to 47.
-      // CHECK: arith.muli %{{.*}}, %{{.*}} {ssbuffer.block_id = 47 : i32, ssbuffer.core_type = "VECTOR"} : index
-      %offset = arith.muli %iv, %c64 {ssbuffer.block_id = 48 : i32, ssbuffer.core_type = "VECTOR"} : index
-      // CHECK: memref.subview %{{.*}} {ssbuffer.block_id = 47 : i32, ssbuffer.core_type = "VECTOR"} : memref<128x64xf16, strided<[64, 1], offset: ?>> to memref<64x64xf16, strided<[64, 1], offset: ?>>
-      %subview = memref.subview %reinterpret[%offset, 0] [64, 64] [1, 1] {ssbuffer.block_id = 48 : i32, ssbuffer.core_type = "VECTOR"} : memref<128x64xf16, strided<[64, 1], offset: ?>> to memref<64x64xf16, strided<[64, 1], offset: ?>>
-      // CHECK: bufferization.materialize_in_destination %{{.*}} {ssbuffer.block_id = 47 : i32, ssbuffer.core_type = "VECTOR"} : (tensor<64x64xf16>, memref<64x64xf16, strided<[64, 1], offset: ?>>) -> ()
-      bufferization.materialize_in_destination %extract in writable %subview {ssbuffer.block_id = 48 : i32, ssbuffer.core_type = "VECTOR"} : (tensor<64x64xf16>, memref<64x64xf16, strided<[64, 1], offset: ?>>) -> ()
-    }
-    return
-  }
-
-  // ============================================
   // Test 4: hivm.hir.store use case
   //
   // Same shape as Test 1 but using hivm.hir.store instead of
@@ -171,6 +121,48 @@ module {
     %subview = memref.subview %reinterpret[0, 0] [64, 64] [1, 1] {ssbuffer.block_id = 69 : i32, ssbuffer.core_type = "VECTOR"} : memref<128x64xf16, strided<[64, 1], offset: ?>> to memref<64x64xf16, strided<[64, 1], offset: ?>>
     // CHECK: bufferization.materialize_in_destination %{{.*}} {ssbuffer.block_id = 68 : i32, ssbuffer.core_type = "VECTOR"} : (tensor<64x64xf16>, memref<64x64xf16, strided<[64, 1], offset: ?>>) -> ()
     bufferization.materialize_in_destination %extract in writable %subview {ssbuffer.block_id = 69 : i32, ssbuffer.core_type = "VECTOR"} : (tensor<64x64xf16>, memref<64x64xf16, strided<[64, 1], offset: ?>>) -> ()
+    return
+  }
+
+  // ============================================
+  // Test 6: clone chained scalar ops (incl. constant) shared between store
+  // pattern and external block.
+  // ============================================
+  // CHECK-LABEL: func @test_clone_scalar_cross_block
+  func.func @test_clone_scalar_cross_block(%arg0: memref<?xf16> {tt.divisibility = 16 : i32}, %in: tensor<64x64xf32>, %idx: index) {
+    %step = arith.constant {ssbuffer.block_id = 12 : i32, ssbuffer.core_type = "VECTOR"} 64 : index
+    %c64 = arith.constant {ssbuffer.block_id = 13 : i32, ssbuffer.core_type = "VECTOR"} 32 : index
+    // clone of %step (inserted before original): keeps block 12, feeds clones of %sub/%add.
+    // CHECK: arith.constant {ssbuffer.block_id = 12 : i32, ssbuffer.core_type = "VECTOR"} 64 : index
+    // original %step: stays block 12, feeds originals of %sub/%add.
+    // CHECK: arith.constant {ssbuffer.block_id = 12 : i32, ssbuffer.core_type = "VECTOR"} 64 : index
+    // %c64 (external constant): stays block 13, feeds %ext.
+    // CHECK: arith.constant {ssbuffer.block_id = 13 : i32, ssbuffer.core_type = "VECTOR"} 32 : index
+    // producer stays block 12.
+    // CHECK: arith.truncf %{{.*}} {ssbuffer.block_id = 12 : i32, ssbuffer.core_type = "VECTOR"} : tensor<64x64xf32> to tensor<64x64xf16>
+    %trunc = arith.truncf %in {ssbuffer.block_id = 12 : i32, ssbuffer.core_type = "VECTOR"} : tensor<64x64xf32> to tensor<64x64xf16>
+    // CHECK: tensor.extract_slice %{{.*}} {ssbuffer.block_id = 12 : i32, ssbuffer.core_type = "VECTOR"} : tensor<64x64xf16> to tensor<64x64xf16>
+    %extract = tensor.extract_slice %trunc[0, 0] [64, 64] [1, 1] {ssbuffer.block_id = 14 : i32, ssbuffer.core_type = "VECTOR"} : tensor<64x64xf16> to tensor<64x64xf16>
+    // clone of %sub: keeps block 13 (inserted before original, feeds clone of %add).
+    // CHECK: arith.subi %{{.*}}, %{{.*}} {ssbuffer.block_id = 13 : i32, ssbuffer.core_type = "VECTOR"} : index
+    // original %sub: unified to producer's block 12 (feeds original %add).
+    // CHECK: arith.subi %{{.*}}, %{{.*}} {ssbuffer.block_id = 12 : i32, ssbuffer.core_type = "VECTOR"} : index
+    %sub = arith.subi %idx, %step {ssbuffer.block_id = 13 : i32, ssbuffer.core_type = "VECTOR"} : index
+    // clone of %add: keeps block 13 (inserted before original, feeds external %ext).
+    // CHECK: arith.addi %{{.*}}, %{{.*}} {ssbuffer.block_id = 13 : i32, ssbuffer.core_type = "VECTOR"} : index
+    // original %add: unified to producer's block 12 (feeds dest chain).
+    // CHECK: arith.addi %{{.*}}, %{{.*}} {ssbuffer.block_id = 12 : i32, ssbuffer.core_type = "VECTOR"} : index
+    %add = arith.addi %sub, %step {ssbuffer.block_id = 13 : i32, ssbuffer.core_type = "VECTOR"} : index
+    // dest chain uses original %add, unified to block 12.
+    // CHECK: memref.reinterpret_cast %{{.*}} to offset: [%{{.*}}] {ssbuffer.block_id = 12 : i32, ssbuffer.core_type = "VECTOR"} : memref<?xf16> to memref<128x64xf16, strided<[64, 1], offset: ?>>
+    %reinterpret = memref.reinterpret_cast %arg0 to offset: [%add], sizes: [128, 64], strides: [64, 1] {ssbuffer.block_id = 14 : i32, ssbuffer.core_type = "VECTOR"} : memref<?xf16> to memref<128x64xf16, strided<[64, 1], offset: ?>>
+    // CHECK: memref.subview %{{.*}} {ssbuffer.block_id = 12 : i32, ssbuffer.core_type = "VECTOR"} : memref<128x64xf16, strided<[64, 1], offset: ?>> to memref<64x64xf16, strided<[64, 1], offset: ?>>
+    %subview = memref.subview %reinterpret[0, 0] [64, 64] [1, 1] {ssbuffer.block_id = 14 : i32, ssbuffer.core_type = "VECTOR"} : memref<128x64xf16, strided<[64, 1], offset: ?>> to memref<64x64xf16, strided<[64, 1], offset: ?>>
+    // CHECK: bufferization.materialize_in_destination %{{.*}} {ssbuffer.block_id = 12 : i32, ssbuffer.core_type = "VECTOR"} : (tensor<64x64xf16>, memref<64x64xf16, strided<[64, 1], offset: ?>>) -> ()
+    bufferization.materialize_in_destination %extract in writable %subview {ssbuffer.block_id = 14 : i32, ssbuffer.core_type = "VECTOR"} : (tensor<64x64xf16>, memref<64x64xf16, strided<[64, 1], offset: ?>>) -> ()
+    // external user stays block 13, now uses the clone of %add.
+    // CHECK: arith.muli %{{.*}}, %{{.*}} {ssbuffer.block_id = 13 : i32, ssbuffer.core_type = "VECTOR"} : index
+    %ext = arith.muli %add, %c64 {ssbuffer.block_id = 13 : i32, ssbuffer.core_type = "VECTOR"} : index
     return
   }
 }

@@ -38,6 +38,7 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -77,7 +78,7 @@ static Value getStoreDest(Operation *storeOp)
     return Value();
 }
 
-static bool isViewLikeOp(Operation *op)
+static bool isViewOrExtractSliceOp(Operation *op)
 {
     return isa<ViewLikeOpInterface>(op) || isa<tensor::ExtractSliceOp>(op);
 }
@@ -99,7 +100,7 @@ static Operation *traceProducerOp(Operation *storeOp, SmallVector<Operation *> &
     Value cur = getStoreSource(storeOp);
     while (Operation *defOp = cur.getDefiningOp()) {
         // view-like op (incl. tensor.extract_slice): transparent, pierce through
-        if (isViewLikeOp(defOp)) {
+        if (isViewOrExtractSliceOp(defOp)) {
             dataViewOps.push_back(defOp);
             cur = getViewSourceValue(defOp);
             continue;
@@ -111,7 +112,7 @@ static Operation *traceProducerOp(Operation *storeOp, SmallVector<Operation *> &
         }
         // hit: a real compute op; only unifiable if it has the same core type as storeOp
         if (CVPipeline::getOpCoreType(defOp) != CVPipeline::getOpCoreType(storeOp)) {
-            LOG_DEBUG("Producer op is not VECTOR_ONLY: " << *defOp);
+            LOG_DEBUG("Producer op is not VECTOR_ONLY: " << *defOp<<"\n");
             return nullptr;
         }
         LOG_DEBUG("Find producer op: " << *defOp);
@@ -146,7 +147,7 @@ static void collectViewOpsToUnify(SmallVector<Operation *> &ops, Operation *stor
     // view op whose block_id matches storeOp's block_id.
     Value cur = getStoreDest(storeOp);
     while (Operation *defOp = cur.getDefiningOp()) {
-        if (!isViewLikeOp(defOp)) {
+        if (!isViewOrExtractSliceOp(defOp)) {
             break;
         }
         addIfMatch(defOp);
@@ -155,15 +156,15 @@ static void collectViewOpsToUnify(SmallVector<Operation *> &ops, Operation *stor
 }
 
 /**
- * @brief Recursively collect scalar-like dependencies, filtered by block_id.
+ * @brief Recursively collect scalar-like dependencies within the same big block.
  *
  * For every scalar-like operand of each op in @p ops (and of @p storeOp's
  * control-flow ancestor ops, e.g. scf.for lb/ub/step), append its defining op
- * only if its block_id equals storeBlockId. Non-matching scalar ops are
- * skipped. The defining op itself is collected (no getAncestorInBlock folding),
- * so scalars defined in outer blocks are also unified.
+ * only if it lives in the same big block as @p storeOp. Scalars defined in
+ * outer blocks (e.g. func-level constants) are skipped, because moving them
+ * across blocks is unsafe and they are typically shared by many blocks.
  */
-static void collectScalarDeps(SmallVector<Operation *> &ops, Operation *storeOp, 
+static void collectScalarDeps(SmallVector<Operation *> &ops, Operation *storeOp,
                               CVPipeline::ComputeBlockIdManager &bm,
                               SmallPtrSet<Operation *, 16> &seen)
 {
@@ -188,9 +189,12 @@ static void collectScalarDeps(SmallVector<Operation *> &ops, Operation *storeOp,
             if (!defOp) {
                 continue; // block argument, no block_id to change
             }
-            // only collect scalar ops whose block_id matches the store's
-            if (bm.getBlockIdByOp(defOp) != bm.getBlockIdByOp(storeOp) || 
-                !seen.insert(defOp).second) {
+            // only collect scalar ops in the same big block as storeOp;
+            // outer-block scalars (e.g. func-level constants) are skipped.
+            if (defOp->getBlock() != storeOp->getBlock()) {
+                continue;
+            }
+            if (!seen.insert(defOp).second) {
                 continue;
             }
             ops.push_back(defOp);
@@ -224,15 +228,24 @@ static SmallVector<Operation *> collectOpsToUnify(Operation *storeOp,
     return opsToUnify;
 }
 
-static LogicalResult tryUnifyForStore(Operation *storeOp,
-                                      const CVPipeline::MemoryDependenceGraph &memGraph,
-                                      CVPipeline::ComputeBlockIdManager &bm)
+/**
+ * @brief Match a store pattern: trace producer, collect ops to unify.
+ *
+ * @return true if the pattern is matched and ready for apply, false to skip.
+ *
+ * @note producer is inserted as the first element of @p matchedOps (required
+ *       by cloneScalarOpsForCrossBlockUses to identify the target block),
+ *       followed by the store op, view ops, and scalar dependencies.
+ */
+static bool matchStorePattern(Operation *storeOp,
+                              CVPipeline::ComputeBlockIdManager &bm,
+                              SetVector<Operation *> &matchedOps)
 {
-    LOG_DEBUG("Start from storeOp: " << *storeOp << "\n");
+    LOG_DEBUG("Start from storeOp: " << *storeOp);
     int storeBlockId = bm.getBlockIdByOp(storeOp);
     if (storeBlockId == -1) {
         LOG_DEBUG("storeOp has no block_id, cannot unify! ");
-        return failure();
+        return false;
     }
 
     // Step 1: trace producer op from store.source, skipping views + scalars,
@@ -240,30 +253,46 @@ static LogicalResult tryUnifyForStore(Operation *storeOp,
     SmallVector<Operation *> dataViewOps;
     Operation *producer = traceProducerOp(storeOp, dataViewOps);
     if (!producer) {
-        return success(); // block argument / fully-scalar chain / core_type mismatch -> skip
+        return false; // block argument / fully-scalar chain / core_type mismatch -> skip
     }
 
     int targetBlockId = bm.getBlockIdByOp(producer);
     if (targetBlockId == -1 || targetBlockId == storeBlockId) {
-        LOG_DEBUG("ProducerOp has no block_id, or block_id is the same as storeOp's, no need to unify");
-        return success(); // producer has no block_id, cannot unify
+        LOG_DEBUG("ProducerOp has no block_id, or block_id is the same as storeOp's, no need to unify\n");
+        return false; // producer has no block_id, cannot unify
     }
 
-    // Step 2: build opsToUnify = {store} + viewOps + scalarDeps.
+    // Step 2: build matchedOps = {producer} + {store} + viewOps + scalarDeps.
+    //         producer first is required by cloneScalarOpsForCrossBlockUses.
+    matchedOps.insert(producer);
     SmallVector<Operation *> opsToUnify = collectOpsToUnify(storeOp, dataViewOps, bm);
+    matchedOps.insert(opsToUnify.begin(), opsToUnify.end());
+    return true;
+}
 
-    // Step 3: cycle detection. On cycle, fail (no fallback per design §6).
-    if (CVPipeline::willCreateCycle(opsToUnify, memGraph, targetBlockId, bm)) {
-        LOG_DEBUG("Cycle detected, cannot unify storeOp!");
-        return failure();
+/**
+ * @brief Apply store unify: cycle detection + block_id update.
+ *
+ * @return true on success, false if cycle detected (pattern is skipped).
+ */
+static bool applyStoreUnify(const SetVector<Operation *> &matchedOps,
+                            const CVPipeline::MemoryDependenceGraph &memGraph,
+                            CVPipeline::ComputeBlockIdManager &bm)
+{
+    Operation *producer = matchedOps[0];
+    int targetBlockId = bm.getBlockIdByOp(producer);
+
+    SmallVector<Operation *> opsToUnifyList(matchedOps.begin(), matchedOps.end());
+    if (CVPipeline::willCreateCycle(opsToUnifyList, memGraph, targetBlockId, bm)) {
+        LOG_DEBUG("Cycle detected, cannot unify storeOp to producer!\n");
+        return false;
     }
 
-    // Step 4: unify block_id of every op in opsToUnify to the producer's.
-    for (Operation *op : opsToUnify) {
+    for (Operation *op : matchedOps) {
         bm.updateBlockId(op, targetBlockId);
     }
-    LOG_DEBUG("Successfully unify storeOp: " << *storeOp);
-    return success();
+    LOG_DEBUG("Successfully unify storeOps\n");
+    return true;
 }
 
 } // anonymous namespace
@@ -290,22 +319,42 @@ class UnifyStoreBlockPass : public PassWrapper<UnifyStoreBlockPass, OperationPas
         CVPipeline::MemoryDependenceGraph memGraph(module, aa);
         auto bm = CVPipeline::ComputeBlockIdManager(module);
 
-        // Step 1: collect all store-semantic ops (MaterializeInDestinationOp,
-        //         hivm::StoreOp) in program order. Only VECTOR-core stores are
-        //         candidates (CUBE-core stores are not unified here).
-        SmallVector<Operation *> storeOps;
+        // Phase 1: collect all matched store patterns (read-only, no modification).
+        //          Only VECTOR-core stores are candidates.
+        SmallVector<SetVector<Operation *>> allMatchedPatterns;
         module.walk([&](Operation *op) {
             if (isStoreOp(op) &&
                 CVPipeline::getOpCoreType(op) == CVPipeline::CoreType::VECTOR_ONLY) {
-                storeOps.push_back(op);
+                SetVector<Operation *> matchedOps;
+                if (matchStorePattern(op, bm, matchedOps)) {
+                    allMatchedPatterns.push_back(std::move(matchedOps));
+                }
             }
         });
+        LOG_DEBUG("Found " << allMatchedPatterns.size() << " store patterns");
 
-        // Step 2: for each storeOp, try to unify its block_id with the producer's.
-        for (Operation *storeOp : storeOps) {
-            if (failed(tryUnifyForStore(storeOp, memGraph, bm))) {
-                signalPassFailure();
-                return;
+        // Phase 2: clone scalar ops shared between a pattern and other blocks,
+        //          so that moving pattern ops into the producer's block_id does
+        //          not create cross-block dependency cycles.
+        //          In order to avoid cycle, clone scalar-like ops.
+        //          A   ->   D
+        //           ↘      ↗
+        //            B -> C
+        //          Now we want to fuse D to A, so clone C' scalarOps for 
+        //          D dependencies to avoid cycle.
+        auto bmOriginal = CVPipeline::ComputeBlockIdManager(module);
+        for (auto &matchedOps : allMatchedPatterns) {
+            CVPipeline::cloneScalarOpsForCrossBlockUses(bmOriginal, matchedOps);
+        }
+
+        // Phase 3: for each pattern, cycle detection + block_id update.
+        //          Rebuild bm because cloning may have added new ops.
+        auto bmNew = CVPipeline::ComputeBlockIdManager(module);
+        for (auto &matchedOps : allMatchedPatterns) {
+            if (!applyStoreUnify(matchedOps, memGraph, bmNew)) {
+                for (Operation *op : matchedOps) {
+                    LOG_DEBUG("Cannot set block id for ops: " << *op);
+                }
             }
         }
 
