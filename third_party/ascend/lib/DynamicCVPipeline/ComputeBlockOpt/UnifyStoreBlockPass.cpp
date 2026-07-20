@@ -52,7 +52,7 @@ using namespace triton;
 
 namespace {
 
-static bool isStoreOp(Operation *op) {
+static bool isStoreOp(const Operation *op) {
   return isa<bufferization::MaterializeInDestinationOp>(op) ||
          isa<hivm::StoreOp>(op);
 }
