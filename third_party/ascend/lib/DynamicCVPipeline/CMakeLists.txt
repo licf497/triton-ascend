@@ -34,6 +34,10 @@ file(GLOB PRE_CHECK_AVAILABLE_SRC_FILES CONFIGURE_DEPENDS
     "PreCheckAvailable/*.cpp"
 )
 
+file(GLOB DECOUPLE_LOAD_AND_COMPUTE_SRC_FILES CONFIGURE_DEPENDS
+    "DecoupleLoadAndCompute/*.cpp"
+)
+
 add_triton_library(DynamicCVPipeline
   AddDynamicCVPipeline.cpp
   PreCheckAvailable.cpp
@@ -59,6 +63,8 @@ add_triton_library(DynamicCVPipeline
   ${ALLOC_MULTI_CACHE_SRCS_FILES}
   ${ADD_CONTROLFLOW_CONDITION_SRC_FILES}
 	RemoveAttributes.cpp
+  DecoupleLoadAndComputePass.cpp
+  ${DECOUPLE_LOAD_AND_COMPUTE_SRC_FILES}
 
   DEPENDS
   AddDynamicCVPipelinePassIncGen

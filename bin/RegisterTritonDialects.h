@@ -194,6 +194,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerRefineArgsBlockIdPasses();
   mlir::triton::registerAsyncLoadHoistingPasses();
   mlir::triton::registerAddMultiBufferToGMLoadPasses();
+  mlir::triton::registerDecoupleLoadAndComputePasses();
 
   registry.insert<
       mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,
