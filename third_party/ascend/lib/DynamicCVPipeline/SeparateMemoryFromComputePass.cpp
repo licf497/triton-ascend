@@ -21,8 +21,8 @@
  */
 
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromComputePass.h"
-#include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/MarkGMLoadPass.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/Debug.h"
 
@@ -43,6 +43,7 @@ void SeparateMemoryFromComputePass::runOnOperation() {
   OpPassManager pm(module.getOperationName());
   LDBG("Enter SeparateMemoryFromCompute pass");
 
+  pm.addPass(createMarkGMLoadPass());
 
   if (failed(runPipeline(pm, module))) {
     module->emitError() << "[" << DEBUG_TYPE << "] Pass failed!";
@@ -60,6 +61,10 @@ namespace triton {
 
 std::unique_ptr<OperationPass<ModuleOp>> createSeparateMemoryFromComputePass() {
   return std::make_unique<SeparateMemoryFromComputePass>();
+}
+
+void registerSeparateMemoryFromComputePasses() {
+  registerPass(createMarkGMLoadPass);
 }
 
 } // namespace triton

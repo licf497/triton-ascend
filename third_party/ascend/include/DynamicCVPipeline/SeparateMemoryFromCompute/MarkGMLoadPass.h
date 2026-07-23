@@ -20,8 +20,10 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_ADAPTER_SEPARATE_MEMORY_FROM_COMPUTE_PASS_H
-#define TRITON_ADAPTER_SEPARATE_MEMORY_FROM_COMPUTE_PASS_H
+#ifndef TRITON_ADAPTER_MARK_GM_LOAD_PASS_H
+#define TRITON_ADAPTER_MARK_GM_LOAD_PASS_H
+
+#include <memory>
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -29,23 +31,25 @@
 namespace mlir {
 namespace triton {
 
-/// Sub-pipeline pass that separates memory from compute operations.
-class SeparateMemoryFromComputePass
-    : public PassWrapper<SeparateMemoryFromComputePass,
-                         OperationPass<ModuleOp>> {
+/// Sub-pass of SeparateMemoryFromComputePass that marks global memory load
+/// operations to be decoupled from compute operations.
+class MarkGMLoadPass
+    : public PassWrapper<MarkGMLoadPass, OperationPass<ModuleOp>> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SeparateMemoryFromComputePass)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MarkGMLoadPass)
 
-  SeparateMemoryFromComputePass() = default;
+  MarkGMLoadPass() = default;
+
+  StringRef getArgument() const override { return "mark-gm-load"; }
+
+  void getDependentDialects(DialectRegistry &registry) const override;
 
   void runOnOperation() override;
 };
 
-std::unique_ptr<OperationPass<ModuleOp>> createSeparateMemoryFromComputePass();
-
-void registerSeparateMemoryFromComputePasses();
+std::unique_ptr<OperationPass<ModuleOp>> createMarkGMLoadPass();
 
 } // namespace triton
 } // namespace mlir
 
-#endif // TRITON_ADAPTER_SEPARATE_MEMORY_FROM_COMPUTE_PASS_H
+#endif // TRITON_ADAPTER_MARK_GM_LOAD_PASS_H
