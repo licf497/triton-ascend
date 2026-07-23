@@ -23,8 +23,6 @@
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromComputePass.h"
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
-#include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/AddMultiBufferToGMLoadPass.h"
-#include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/AsyncLoadHoistingPass.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/Debug.h"
 
@@ -42,22 +40,9 @@ void SeparateMemoryFromComputePass::runOnOperation() {
     return;
   }
 
-  int depth = BufferCountManager(module).getBufferCountByType(
-      BufferCountManager::DepType::LoadStore);
-
-  if (depth <= 1) {
-    LDBG("Buffer depth <= 1, skip multi-buffer transformation");
-    return;
-  }
-
   OpPassManager pm(module.getOperationName());
   LDBG("Enter SeparateMemoryFromCompute pass");
 
-  // Step 1: Hoist memory operations out of compute blocks
-  pm.addPass(createAsyncLoadHoistingPass());
-
-  // Step 2: Apply multi-buffering to memory operations
-  pm.addPass(createAddMultiBufferToGMLoadPass());
 
   if (failed(runPipeline(pm, module))) {
     module->emitError() << "[" << DEBUG_TYPE << "] Pass failed!";
