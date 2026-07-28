@@ -32,9 +32,11 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 
@@ -59,15 +61,51 @@ struct MarkCandidate {
   int bufferCount;           // filled in Phase 2
 };
 
+// Resolve whether a BlockArgument of func::FuncOp traces to a GM pointer.
+// Returns:
+//  - true if the arg belongs to the entry function (=> GM load source)
+//  - false + non-null nextValue: trace through the caller's corresponding
+//  operand, continue tracing
+//  - false + null nextValue: tracing failed (no module / no caller)
+static bool resolveFuncBlockArg(BlockArgument blockArg, func::FuncOp funcOp,
+                                Value &nextValue) {
+  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+  if (!moduleOp) {
+    LOG_DEBUG("[warning] moduleOp is null");
+    return false;
+  }
+  if (SymbolTable::symbolKnownUseEmpty(funcOp.getNameAttr(), moduleOp)) {
+    return true; // entry func argument => GM load
+  }
+  // Non-entry func: trace through callers.
+  auto symbolUses = SymbolTable::getSymbolUses(funcOp.getNameAttr(), moduleOp);
+  if (symbolUses && !symbolUses->empty()) {
+    // get funcOp's caller, continue tracing
+    auto callOp = cast<func::CallOp>((*symbolUses->begin()).getUser());
+    nextValue = callOp.getOperands()[blockArg.getArgNumber()];
+    return false;
+  }
+  LOG_DEBUG("[warning] Non-entry func: no caller uses "
+            << funcOp.getNameAttr());
+  return false;
+}
+
 // Rule 1: Pierce view-like ops and trace scf.for / scf.while iter_args back to
 // their init values. Returns true only when the terminal is a BlockArgument
-// owned by a func::FuncOp (i.e. a GM pointer function argument).
+// owned by the entry func::FuncOp (i.e. a GM pointer function argument).
 static bool traceSourceToFuncArg(Value v) {
   while (true) {
-    // 1. Pierce view-like ops.
-    while (auto viewLike =
-               dyn_cast_or_null<ViewLikeOpInterface>(v.getDefiningOp())) {
-      v = viewLike.getViewSource();
+    // 1. Pierce view-like ops and tensor.extract_slice.
+    while (auto *defOp = v.getDefiningOp()) {
+      if (auto viewLike = dyn_cast<ViewLikeOpInterface>(defOp)) {
+        v = viewLike.getViewSource();
+        continue;
+      }
+      if (auto extractSlice = dyn_cast<tensor::ExtractSliceOp>(defOp)) {
+        v = extractSlice.getSource();
+        continue;
+      }
+      break;
     }
     // 2. Check terminal: must be a BlockArgument.
     auto blockArg = dyn_cast<BlockArgument>(v);
@@ -75,8 +113,17 @@ static bool traceSourceToFuncArg(Value v) {
       return false; // ends at a defining op, not a GM arg
     }
     Operation *parentOp = blockArg.getOwner()->getParentOp();
-    if (isa<func::FuncOp>(parentOp)) {
-      return true; // func argument => GM load
+
+    if (auto funcOp = dyn_cast<func::FuncOp>(parentOp)) {
+      Value nextV;
+      if (resolveFuncBlockArg(blockArg, funcOp, nextV)) {
+        return true; // find GM load source in funcOp arg
+      }
+      if (nextV) {
+        v = nextV;
+        continue;
+      }
+      return false;
     }
     if (auto forOp = dyn_cast<scf::ForOp>(parentOp)) {
       // iter_arg: trace its init value (skip induction var at index 0).
@@ -96,18 +143,28 @@ static bool traceSourceToFuncArg(Value v) {
         v = condOp.getArgs()[blockArg.getArgNumber()];
         continue;
       }
+      LOG_DEBUG("[warning] unsupport while op ");
       return false;
     }
+    LOG_DEBUG("[warning] unsupport iterarg or control flow");
     return false; // other BlockArgument kinds
   }
 }
 
-// Rule 2: Pierce view-like ops on the dest chain and return the backing
-// memref::AllocOp, or null if the chain does not terminate at one.
+// Rule 2: Pierce view-like ops and tensor.extract_slice on the dest chain
+// and return the backing memref::AllocOp, or null if the chain does not
+// terminate at one.
 static memref::AllocOp traceDestToAlloc(Value v) {
-  while (auto viewLike =
-             dyn_cast_or_null<ViewLikeOpInterface>(v.getDefiningOp())) {
-    v = viewLike.getViewSource();
+  while (auto *defOp = v.getDefiningOp()) {
+    if (auto viewLikeOp = dyn_cast<ViewLikeOpInterface>(defOp)) {
+      v = viewLikeOp.getViewSource();
+      continue;
+    }
+    if (auto extractSliceOp = dyn_cast<tensor::ExtractSliceOp>(defOp)) {
+      v = extractSliceOp.getSource();
+      continue;
+    }
+    break;
   }
   return dyn_cast_or_null<memref::AllocOp>(v.getDefiningOp());
 }
@@ -151,21 +208,34 @@ static std::optional<MarkCandidate> collectCandidate(memref::CopyOp copyOp) {
   return MarkCandidate{copyOp, allocOp, scopeOp};
 }
 
-// Phase 3: insert annotation::MarkOp with multi_buffer attr on the dest alloc.
-// Returns false when bufferCount <= 1 (skip marking), true otherwise.
+// Phase 3: insert or update annotation::MarkOp with multi_buffer attr on the
+// dest alloc. Returns false when bufferCount <= 1 (skip marking), true
+// otherwise.
 static bool markGMLoadCandidate(MarkCandidate &c) {
   if (c.bufferCount <= 1) {
     LOG_DEBUG("bufferCount <= 1, skip marking");
     return false;
   }
+  // Check if an annotation::MarkOp already exists for this alloc.
+  annotation::MarkOp existingMarkOp = nullptr;
+  for (auto *user : c.destAlloc->getUsers()) {
+    if (auto markOp = dyn_cast<annotation::MarkOp>(user)) {
+      existingMarkOp = markOp;
+      break;
+    }
+  }
   OpBuilder builder(c.destAlloc);
-  builder.setInsertionPointAfter(c.destAlloc);
-  auto markOp = builder.create<annotation::MarkOp>(c.destAlloc->getLoc(),
-                                                   c.destAlloc.getResult());
-  markOp->setAttr(hivm::MultiBufferAttr::name,
-                  builder.getI32IntegerAttr(c.bufferCount));
-  LOG_DEBUG("marked multi_buffer = " << c.bufferCount << " on " << c.destAlloc
-                                     << "\n");
+  if (existingMarkOp) {
+    existingMarkOp->setAttr(hivm::MultiBufferAttr::name,
+                            builder.getI32IntegerAttr(c.bufferCount));
+  } else {
+    builder.setInsertionPointAfter(c.destAlloc);
+    auto markOp = builder.create<annotation::MarkOp>(c.destAlloc->getLoc(),
+                                                     c.destAlloc.getResult());
+    markOp->setAttr(hivm::MultiBufferAttr::name,
+                    builder.getI32IntegerAttr(c.bufferCount));
+  }
+  LOG_DEBUG("marked multi_buffer = " << c.bufferCount << " on " << c.destAlloc);
   return true;
 }
 
