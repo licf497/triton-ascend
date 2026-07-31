@@ -57,6 +57,9 @@ void ComputeBlockOptPass::runOnOperation()
     pm.addPass(createFixpipeOptPass());
     pm.addPass(createReorderOpsByBlockIdPass());
 
+    pm.addPass(createMergeComputeBlockPass());
+    pm.addPass(createReorderOpsByBlockIdPass());
+
     if (failed(runPipeline(pm, module))) {
         signalPassFailure();
         return;
@@ -78,6 +81,7 @@ void registerComputeBlockOptPasses()
     registerPass(createUnifyAllocBlockPass);
     registerPass(createMergeVectorIfBlockPass);
     registerPass(createMergeCubeForBlockPass);
+    registerPass(createMergeComputeBlockPass);
     registerPass(createFixpipeOptPass);
 }
 

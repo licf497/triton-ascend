@@ -37,6 +37,7 @@ void registerMergeVectorIfBlockPass();
 std::unique_ptr<OperationPass<ModuleOp>> createMergeCubeForBlockPass();
 void registerMergeCubeForBlockPass();
 std::unique_ptr<OperationPass<ModuleOp>> createFixpipeOptPass();
+std::unique_ptr<OperationPass<ModuleOp>> createMergeComputeBlockPass();
 
 } // namespace triton
 } // namespace mlir
