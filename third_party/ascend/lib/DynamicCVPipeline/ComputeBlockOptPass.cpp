@@ -57,8 +57,10 @@ void ComputeBlockOptPass::runOnOperation()
     pm.addPass(createFixpipeOptPass());
     pm.addPass(createReorderOpsByBlockIdPass());
 
-    pm.addPass(createMergeComputeBlockPass());
-    pm.addPass(createReorderOpsByBlockIdPass());
+    if (CVPipeline::isMergeComputeBlockEnabled()) {
+        pm.addPass(createMergeComputeBlockPass());
+        pm.addPass(createReorderOpsByBlockIdPass());
+    }
 
     if (failed(runPipeline(pm, module))) {
         signalPassFailure();

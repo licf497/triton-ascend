@@ -90,6 +90,9 @@ bool isCubeBlockMergeEnabled();
 void setEnableUBRefineOpt(bool enable);
 bool isUBRefineOptEnabled();
 
+void setEnableMergeComputeBlock(bool enable);
+bool isMergeComputeBlockEnabled();
+
 // Functions for managing core types
 CoreType getOpCoreType(Operation *op);
 std::optional<int> getOpBlockId(Operation *op);

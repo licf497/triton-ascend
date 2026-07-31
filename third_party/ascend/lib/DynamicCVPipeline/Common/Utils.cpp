@@ -19,6 +19,7 @@ namespace CVPipeline {
 
 static bool g_enableCubeBlockMerge = true;
 static bool g_enableUBRefineOpt = false;
+static bool g_enableMergeComputeBlock = false;
 
 void setEnableCubeBlockMerge(bool enable)
 {
@@ -28,6 +29,16 @@ void setEnableCubeBlockMerge(bool enable)
 bool isCubeBlockMergeEnabled()
 {
     return g_enableCubeBlockMerge;
+}
+
+void setEnableMergeComputeBlock(bool enable)
+{
+    g_enableMergeComputeBlock = enable;
+}
+
+bool isMergeComputeBlockEnabled()
+{
+    return g_enableMergeComputeBlock;
 }
 
 CoreType getOpCoreType(Operation *op)
