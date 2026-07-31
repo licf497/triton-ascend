@@ -37,6 +37,19 @@ bool isCubeBlockMergeEnabled()
     return g_enableCubeBlockMerge;
 }
 
+void setEnableMergeComputeBlock(ModuleOp &module, bool enable)
+{
+    OpBuilder builder(module.getContext());
+    if (enable) {
+        module->setAttr(kEnableMergeComputeBlock, builder.getUnitAttr());
+    }
+}
+
+bool isMergeComputeBlockEnabled(ModuleOp module)
+{
+    return module->getAttr(kEnableMergeComputeBlock) != nullptr;
+}
+
 CoreType getOpCoreType(Operation *op)
 {
     if (!op) {
