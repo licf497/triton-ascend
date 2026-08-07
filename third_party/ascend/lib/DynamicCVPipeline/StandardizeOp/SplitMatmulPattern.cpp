@@ -359,94 +359,6 @@ static bool isSubviewFromGlobalMemory(ViewLikeOpInterface viewOp) {
 }
 
 /**
- * Determines whether a matmul operation should be split based on its output
- * usage. A split is needed when the matmul output is used in ways that would
- * cause hardware issues:
- * 1. (Specific scenarios Filter) Output is used by a nested matmul (L0C -> L0C)
- * which causes NPUIR fixpipe errors.
- * 2. Output is used as input A or B of another matmul (L0C -> L1), which
- * requires materialization to global memory.
- *
- * Parameters:
- *   matmulOp     - The matmul operation to check.
- *   outerOutValue   - The outermost result value in the use-def chain.
- *   outerInValue - The outermost initial value (bias) in the use-def chain.
- *
- * Returns:
- *   true if the matmul should be split due to output usage, false otherwise.
- */
-static bool isOutputFilter(linalg::MatmulOp matmulOp, Value &outerOutValue,
-                           Value &outerInValue) {
-  // Specific scenario: used by store and nextUser is nested
-  auto matchStoreGm = [](Operation *op, Value value) {
-    if (auto nextStoreGM =
-            dyn_cast<bufferization::MaterializeInDestinationOp>(op)) {
-      Value dest = nextStoreGM.getDest();
-      auto viewOp = dest.getDefiningOp<ViewLikeOpInterface>();
-      return isSubviewFromGlobalMemory(viewOp);
-    } else if (auto hivmStore = dyn_cast<hivm::StoreOp>(op)) {
-      auto dest = hivmStore.getDst();
-      auto viewOp = dest.getDefiningOp<ViewLikeOpInterface>();
-      return isSubviewFromGlobalMemory(viewOp);
-    }
-    return false;
-  };
-  auto storeToGM =
-      traceChainUser(outerOutValue, false, matchStoreGm,
-                     [](Operation *op, Value value) { return false; });
-  if (storeToGM.has_value() &&
-      storeToGM.value()->getBlock() != outerOutValue.getParentBlock()) {
-    LOG_DEBUG("(store) Split because avoiding NPUIR insert fixpipe errors. "
-              << matmulOp);
-    return true;
-  }
-
-  // Specific scenario: used by single L0C and nextUser is nested
-  auto matchMatmulC = [](Operation *op, Value value) {
-    if (auto nextMatmulOp = dyn_cast<linalg::MatmulOp>(op)) {
-      auto inputs = parseMatmulInputs(nextMatmulOp);
-      return inputs.a != value && inputs.b != value && inputs.bias == value;
-    }
-    return false;
-  };
-  auto usedByL0C =
-      traceChainUser(outerOutValue, true, matchMatmulC,
-                     [](Operation *op, Value value) { return false; });
-  if (usedByL0C.has_value() &&
-      usedByL0C.value()->getBlock() != outerOutValue.getParentBlock()) {
-    LOG_DEBUG("(first) Split because avoiding NPUIR insert fixpipe errors. "
-              << matmulOp);
-    return true;
-  }
-  return false;
-}
-static bool shouldSplitByOutput(linalg::MatmulOp matmulOp, Value &outerOutValue,
-                                Value &outerInValue) {
-  if (isOutputFilter(matmulOp, outerOutValue, outerInValue)) {
-    return true;
-  }
-  // used by any L1
-  auto matchMatmulAB = [](Operation *op, Value value) {
-    if (auto nextMatmulOp = dyn_cast<linalg::MatmulOp>(op)) {
-      auto inputs = parseMatmulInputs(nextMatmulOp);
-      return inputs.a == value || inputs.b == value;
-    }
-    return false;
-  };
-  auto skipCubeop = [=](Operation *op, Value value) {
-    return isa<linalg::TransposeOp>(op);
-  };
-  auto usedByL1 =
-      traceChainUser(outerOutValue, false, matchMatmulAB, skipCubeop);
-  if (usedByL1.has_value()) {
-    LOG_DEBUG("Split avoid L0C -> L1. " << matmulOp); // S01-S08
-    return true;
-  }
-
-  return false;
-}
-
-/**
  * Determines whether a matmul operation should be split based on its input
  * (bias) source. The split is avoided when:
  * 1. The bias is filled with zeros (no need to split).
@@ -566,8 +478,7 @@ static std::optional<SplitInfo> handleMayNotExec(linalg::MatmulOp matmulOp) {
  * analysis. This function performs a complete analysis of the matmul
  * operation's context, including:
  * 1. Tracing the use-def chain of the output to find the outermost scope.
- * 2. Evaluating input-based split criteria via shouldSplitByInput() and
- * shouldSplitByOutput().
+ * 2. Evaluating input-based split criteria via shouldSplitByInput().
  *
  * Parameters:
  *   matmulOp - The matmul operation to analyze.
@@ -615,8 +526,7 @@ static std::optional<SplitInfo> shouldSplit(linalg::MatmulOp matmulOp,
     }
   }
 
-  if (!shouldSplitByInput(matmulOp, outerOutValue, outerInValue) &&
-      !shouldSplitByOutput(matmulOp, outerOutValue, outerInValue)) {
+  if (!shouldSplitByInput(matmulOp, outerOutValue, outerInValue)) {
     return SplitInfo{mayNotExec, outerInValue, outerOutValue, false};
   }
 
