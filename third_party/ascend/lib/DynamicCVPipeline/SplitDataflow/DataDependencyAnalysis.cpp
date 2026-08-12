@@ -729,8 +729,22 @@ void DataDependencyAnalysisPass::analyzeExternalInputs(
         continue;
       }
 
-      // Case 1: Cube -> C->C special case
+      // Case 1: Cube -> C->C dependency
       if (coreType == ssbufferCoreTypeCubeAttr) {
+        LOG_DEBUG("Found external input with CUBE core type: " << input
+                                                               << "\n");
+        auto producerIdOpt = CVPipeline::getOpBlockId(input.getDefiningOp());
+        if (!producerIdOpt) {
+          LOG_DEBUG("Warning: [c->c] Producer block ID not found for input "
+                    "value.\n");
+          continue;
+        }
+        int producerId = *producerIdOpt;
+        if (!collectDepInfo(input, DependencyType::CubeToCube,
+                            info.getC2CDependencies(), producerId,
+                            blockInfo.blockId, info)) {
+          continue;
+        }
         continue;
       }
       // Case 2: Vector -> V->C dependency
@@ -1085,6 +1099,7 @@ void DataDependencyAnalysisPass::runOnOperation() {
   // iniConsumerBlockId, iniProducerBlockId)
   deduplicateDependencies(info.getV2CDependencies());
   deduplicateDependencies(info.getC2VDependencies());
+  deduplicateDependencies(info.getC2CDependencies());
   deduplicateDependencies(info.getMemoryDependencies());
 
   info.setValid(true);
@@ -1093,6 +1108,8 @@ void DataDependencyAnalysisPass::runOnOperation() {
   LOG_DEBUG("  V->C dependencies: " << info.getV2CDependencies().size()
                                     << "\n");
   LOG_DEBUG("  C->V dependencies: " << info.getC2VDependencies().size()
+                                    << "\n");
+  LOG_DEBUG("  C->C dependencies: " << info.getC2CDependencies().size()
                                     << "\n");
   LOG_DEBUG("  Memory dependencies: " << info.getMemoryDependencies().size()
                                       << "\n");

@@ -36,6 +36,7 @@
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.h"
+#include "bishengir/Dialect/Utils/Util.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -128,6 +129,33 @@ static void attachCrossCoreDeps(Operation *op, int tid, int seqId,
 static void attachAnalyzeFlagIdTag(Operation *op) {
   MLIRContext *ctx = op->getContext();
   op->setAttr(CVPipeline::kAnalyzeFlagId, UnitAttr::get(ctx));
+}
+
+// Check whether a value is a valid C->C transfer candidate: both its defining
+// op and all of its users must be matmul ops, and the value must be used as an
+// A/B input (not as the bias/init) of each user matmul.
+static bool isValidC2CMatmulDependency(Value value) {
+  if (!isa<linalg::MatmulOp>(value.getDefiningOp())) {
+    return false;
+  }
+  for (Operation *user : value.getUsers()) {
+    auto matmulUser = dyn_cast<linalg::MatmulOp>(user);
+    if (!matmulUser) {
+      return false;
+    }
+    // Value must be one of the matmul's A/B inputs, not the bias (init).
+    bool isABInput = false;
+    for (Value input : matmulUser.getDpsInputs()) {
+      if (input == value) {
+        isABInput = true;
+        break;
+      }
+    }
+    if (!isABInput) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // Block Start/End Operation Retrieval
@@ -1399,6 +1427,109 @@ LogicalResult InterCoreTransferAndSyncPass::handleCubeToVector(
   return success();
 }
 
+// C->C Shared L1 buffer allocation.
+// Allocates before the main loop if one encloses both producer and consumer,
+// otherwise after the producer block end.
+Operation *InterCoreTransferAndSyncPass::createC2CSharedL1Buffer(
+    OpBuilder &builder, Location loc, ArrayRef<int64_t> shape, Type elemType,
+    int prodBlockId, Operation *prodEnd, Operation *consStart) {
+  auto addressSpaceAttr =
+      builder.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::L1);
+  auto allocType = MemRefType::get(shape, elemType, nullptr, addressSpaceAttr);
+
+  Operation *allocOp = nullptr;
+  Operation *mainLoopOp = findMainLoopforTransfer(prodEnd, consStart);
+  if (mainLoopOp) {
+    builder.setInsertionPoint(mainLoopOp);
+    allocOp = builder.create<memref::AllocOp>(loc, allocType);
+    int loopBlockId = CVPipeline::getOpBlockId(mainLoopOp).value_or(-1);
+    attachCommonTags(allocOp, loopBlockId, "CUBE");
+  } else {
+    builder.setInsertionPointAfter(prodEnd);
+    allocOp = builder.create<memref::AllocOp>(loc, allocType);
+    attachCommonTags(allocOp, prodBlockId, "CUBE");
+  }
+  return allocOp;
+}
+
+// C->C Transfer Logic
+LogicalResult InterCoreTransferAndSyncPass::handleCubeToCube(
+    OpBuilder &builder, DependencyInfo &dep, FlagIdManager &flagManager,
+    FlagIdReuseManager &flagIdReuseManager) {
+  mlir::Value srcValue = dep.value;
+  Location loc = srcValue.getLoc();
+
+  auto [prodStart, prodEnd] =
+      getBlockStartEnd(dep.producerBlockId, module); // C Block
+  auto [consStart, consEnd] =
+      getBlockStartEnd(dep.consumerBlockId, module); // C Block
+
+  // Adjust consStart to the first operation that actually reads srcValue
+  // within the consumer block, matching the logic in handleVectorToCube.
+  if (dep.consumerBlockId == dep.iniConsumerBlockId) {
+    auto consumerPoint =
+        analyzeConsumerReadInsertPoint(srcValue, dep.iniConsumerBlockId);
+    if (consumerPoint) {
+      consStart = consumerPoint;
+    }
+  }
+
+  auto srcTensorType = cast<RankedTensorType>(srcValue.getType());
+  int64_t M = srcTensorType.getDimSize(0);
+  int64_t N = srcTensorType.getDimSize(1);
+  Type elemType = srcTensorType.getElementType();
+  auto shape = std::vector<int64_t>{M, N};
+
+  int prodBlockId =
+      CVPipeline::getOpBlockId(srcValue.getDefiningOp()).value_or(-1);
+  int consBlockId = CVPipeline::getOpBlockId(consStart).value_or(-1);
+
+  // Allocate a single shared L1 buffer for producer and consumer.
+  auto *allocOp = createC2CSharedL1Buffer(builder, loc, shape, elemType,
+                                          prodBlockId, prodEnd, consStart);
+
+  // Producer side: insert fixpipe to write matmul L0C output to L1 buffer
+  builder.setInsertionPointAfter(prodEnd);
+  auto dmaModeAttr =
+      FixpipeDMAModeAttr::get(builder.getContext(), FixpipeDMAMode::NZ2NZ);
+  // FixpipeOp with channel_split=True used at B322B32
+  static constexpr int32_t alignM = 16;
+  auto numElemPerBlock = mlir::utils::getNumPerBlock(srcTensorType);
+  bool channelSplit = numElemPerBlock == alignM / 2;
+  auto fixpipeOp = builder.create<hivm::FixpipeOp>(
+      loc, mlir::TypeRange{}, srcValue, allocOp->getResult(0),
+      mlir::ValueRange{}, dmaModeAttr, nullptr, nullptr, nullptr, nullptr,
+      builder.getBoolAttr(channelSplit), nullptr, mlir::ArrayAttr{}, nullptr);
+  attachCommonTags(fixpipeOp, prodBlockId, "CUBE");
+  LOG_DEBUG("[fixpipeOp c->c]: " << *fixpipeOp << "\n");
+
+  // Consumer side: read L1 buffer via MemorySpaceCast + ToTensor
+  builder.setInsertionPoint(consStart);
+  auto plainMemrefType = MemRefType::get(shape, elemType);
+  auto memspaceCastOp = builder.create<memref::MemorySpaceCastOp>(
+      loc, plainMemrefType, allocOp->getResult(0));
+  auto targetTensorType = RankedTensorType::get(shape, elemType);
+  auto toTensorOp = builder.create<bufferization::ToTensorOp>(
+      loc, targetTensorType, memspaceCastOp.getResult(), true, true);
+  attachCommonTags(memspaceCastOp, consBlockId, "CUBE");
+  attachCommonTags(toTensorOp, consBlockId, "CUBE");
+
+  // Replace uses of srcValue within the consumer block
+  llvm::SmallVector<Operation *> users(srcValue.getUsers().begin(),
+                                       srcValue.getUsers().end());
+  for (Operation *user : users) {
+    auto userBlockIdOpt = CVPipeline::getOpBlockId(user);
+    if (userBlockIdOpt && *userBlockIdOpt == dep.iniConsumerBlockId) {
+      user->replaceUsesOfWith(srcValue, toTensorOp.getResult());
+    }
+  }
+
+  LOG_DEBUG("Inserted C->C fixpipe transfer: block "
+            << dep.producerBlockId << " -> block " << dep.consumerBlockId
+            << "\n");
+  return success();
+}
+
 // Memory Dependency
 LogicalResult InterCoreTransferAndSyncPass::handleMemoryDependency(
     OpBuilder &builder, DependencyInfo &dep, size_t depIndex,
@@ -1705,10 +1836,32 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
   }
   LOG_DEBUG("Completed C->V transfers and syncs.\n");
 
+  // Step 3: Handle C->C dependencies (fixpipe L0C to L1)
+  llvm::SmallVector<DependencyInfo> &C2CDependencies =
+      info.getC2CDependencies();
+  sortDependencies(C2CDependencies, module);
+  LOG_DEBUG("[DEBUG] C2CDependencies size: " << C2CDependencies.size() << "\n");
+  for (auto &dep : C2CDependencies) {
+    LOG_DEBUG("[C->C] producerBlockId = " << dep.producerBlockId
+                                          << ", consumerBlockId = "
+                                          << dep.consumerBlockId << "\n");
+    // Only handle C->C transfer when both the defining op and the consuming
+    // users of dep.value are matmul ops.
+    if (!isValidC2CMatmulDependency(dep.value)) {
+      continue;
+    }
+    if (failed(
+            handleCubeToCube(builder, dep, flagManager, flagIdReuseManager))) {
+      LOG_DEBUG("[ERROR] C->C failed! producerBlockId = "
+                << dep.producerBlockId
+                << ", consumerBlockId = " << dep.consumerBlockId << "\n");
+      return failure();
+    }
+  }
+  LOG_DEBUG("Completed C->C transfers and syncs.\n");
+
   llvm::SmallVector<DependencyInfo> &memDependencies =
       info.getMemoryDependencies();
-  LOG_DEBUG("[DEBUG] MemoryDependencies size: " << memDependencies.size()
-                                                << "\n");
 
   for (size_t i = 0; i < memDependencies.size(); ++i) {
     auto &dep = memDependencies[i];
