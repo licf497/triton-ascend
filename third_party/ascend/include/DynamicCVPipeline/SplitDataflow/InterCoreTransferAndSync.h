@@ -118,9 +118,7 @@ private:
                      FlagIdManager &flagManager,
                      FlagIdReuseManager &flagIdReuseManager);
   mlir::LogicalResult handleCubeToCube(mlir::OpBuilder &builder,
-                                       DependencyInfo &dep,
-                                       FlagIdManager &flagManager,
-                                       FlagIdReuseManager &flagIdReuseManager);
+                                       DependencyInfo &dep);
   mlir::LogicalResult handleMemoryDependency(
       mlir::OpBuilder &builder, DependencyInfo &dep, size_t depIndex,
       llvm::SmallVector<DependencyInfo> memDependencies,

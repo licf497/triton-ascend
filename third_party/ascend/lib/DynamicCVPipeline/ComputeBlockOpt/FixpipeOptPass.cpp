@@ -92,7 +92,6 @@ private:
                        CVPipeline::ComputeBlockIdManager &bm);
   bool isSubviewFromGlobalMemory(ViewLikeOpInterface viewOp,
                                  SetVector<Operation *> &matchedOps);
-  bool isValidTrunc(Operation *op);
   bool isValidMul(Operation *op, Value matmulValues,
                   SetVector<Operation *> &matchedOps);
 };
@@ -214,32 +213,6 @@ willCreateCycle(SetVector<Operation *> &willaddOps, Block *block,
     bm.updateBlockId(op, originBlockId[op]);
   }
   return ret;
-}
-
-bool FixpipeOptPass::isValidTrunc(Operation *op) {
-  // Just filter: arith.truncf(f32->bf16, f32->f16, i32->i8)
-  if (auto truncFOp = dyn_cast<arith::TruncFOp>(op)) {
-    Type inType = truncFOp.getIn().getType();
-    Type outType = truncFOp.getResult().getType();
-    if (auto shapedType = dyn_cast<ShapedType>(inType))
-      inType = shapedType.getElementType();
-    if (auto shapedType = dyn_cast<ShapedType>(outType))
-      outType = shapedType.getElementType();
-
-    return isa<Float32Type>(inType) &&
-           (isa<BFloat16Type>(outType) || isa<Float16Type>(outType));
-  }
-  if (auto truncIOp = dyn_cast<arith::TruncIOp>(op)) {
-    Type inType = truncIOp.getIn().getType();
-    Type outType = truncIOp.getResult().getType();
-    if (auto shapedType = dyn_cast<ShapedType>(inType))
-      inType = shapedType.getElementType();
-    if (auto shapedType = dyn_cast<ShapedType>(outType))
-      outType = shapedType.getElementType();
-
-    return inType.isInteger(32) && outType.isInteger(8);
-  }
-  return false;
 }
 
 void transSource(Value value, SetVector<Operation *> &matchedOps,
@@ -471,7 +444,7 @@ bool FixpipeOptPass::matchFixpipePattern(linalg::MatmulOp matmulOp,
 
   auto matmulUser = *matmulResult.getUsers().begin();
 
-  if (isValidTrunc(matmulUser)) {
+  if (CVPipeline::isValidTrunc(matmulUser)) {
     if (isFixpipeCastPattern(matmulUser, matchedOps)) {
       return true;
     }

@@ -94,6 +94,18 @@ void cloneScalarOpsForCrossBlockUses(ComputeBlockIdManager &bmOriginal,
 bool collectViewOpsAndCheckGlobalMemory(Value viewValue,
                                         SetVector<Operation *> &matchedOps);
 
+/**
+ * @brief Check if an op is a valid trunc operation for fixpipe optimization
+ *
+ * Filters for supported trunc patterns:
+ * - arith.truncf: f32 -> bf16, f32 -> f16
+ * - arith.trunci: i32 -> i8
+ *
+ * @param op The operation to check
+ * @return bool Returns true if the op is a supported trunc, false otherwise
+ */
+bool isValidTrunc(Operation *op);
+
 } // namespace CVPipeline
 } // namespace mlir
 

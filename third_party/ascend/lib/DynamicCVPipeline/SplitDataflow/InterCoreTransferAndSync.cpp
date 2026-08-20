@@ -29,6 +29,7 @@
 
 #include "ascend/include/DynamicCVPipeline/Common/FlagIdManager.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Common.h"
 #include "ascend/include/DynamicCVPipeline/SplitDataflow/DataDependencyAnalysis.h"
 #include "ascend/include/DynamicCVPipeline/SplitDataflow/FlagIdReuse.h"
 
@@ -134,10 +135,8 @@ static void attachAnalyzeFlagIdTag(Operation *op) {
 // Check whether a value is a valid C->C transfer candidate: both its defining
 // op and all of its users must be matmul ops, and the value must be used as an
 // A/B input (not as the bias/init) of each user matmul.
-static bool isValidC2CMatmulDependency(Value value) {
-  if (!isa<linalg::MatmulOp>(value.getDefiningOp())) {
-    return false;
-  }
+// Check that all users of \p value are matmul ops consuming it as A/B input.
+static bool allUsersAreMatmulABInput(Value value) {
   for (Operation *user : value.getUsers()) {
     auto matmulUser = dyn_cast<linalg::MatmulOp>(user);
     if (!matmulUser) {
@@ -156,6 +155,28 @@ static bool isValidC2CMatmulDependency(Value value) {
     }
   }
   return true;
+}
+
+/// Check if \p value is a valid C2C matmul dependency. Supports two patterns:
+///   1. matmul -> matmul  (direct)
+///   2. matmul -> trunc -> matmul  (with type conversion)
+static bool isValidC2CMatmulDependency(Value value) {
+  Operation *defOp = value.getDefiningOp();
+
+  // Case 1: Direct matmul -> matmul
+  if (isa<linalg::MatmulOp>(defOp)) {
+    return allUsersAreMatmulABInput(value);
+  }
+
+  // Case 2: matmul -> trunc -> matmul
+  if (CVPipeline::isValidTrunc(defOp)) {
+    if (!isa<linalg::MatmulOp>(defOp->getOperand(0).getDefiningOp())) {
+      return false;
+    }
+    return allUsersAreMatmulABInput(value);
+  }
+
+  return false;
 }
 
 // Block Start/End Operation Retrieval
@@ -1453,35 +1474,55 @@ Operation *InterCoreTransferAndSyncPass::createC2CSharedL1Buffer(
 }
 
 // C->C Transfer Logic
-LogicalResult InterCoreTransferAndSyncPass::handleCubeToCube(
-    OpBuilder &builder, DependencyInfo &dep, FlagIdManager &flagManager,
-    FlagIdReuseManager &flagIdReuseManager) {
-  mlir::Value srcValue = dep.value;
-  Location loc = srcValue.getLoc();
+LogicalResult
+InterCoreTransferAndSyncPass::handleCubeToCube(OpBuilder &builder,
+                                               DependencyInfo &dep) {
+  mlir::Value transferValue = dep.value;
+  Location loc = transferValue.getLoc();
+
+  // Check if this is a matmul -> trunc -> matmul pattern.
+  // If so, use the matmul result (pre-trunc) as the fixpipe source and
+  // fold the type conversion into the fixpipe as pre_quant.
+  Operation *truncOp = nullptr;
+  mlir::Value fixpipeSrcValue = transferValue;
+  std::optional<FixpipePreQuantMode> quantMode;
+
+  if (CVPipeline::isValidTrunc(transferValue.getDefiningOp())) {
+    fixpipeSrcValue = transferValue.getDefiningOp()->getOperand(0);
+    // Determine pre_quant mode from the trunc's input/output types.
+    Type inType = getElementTypeOrSelf(fixpipeSrcValue.getType());
+    Type outType = getElementTypeOrSelf(transferValue.getType());
+    if (inType.isF32() && outType.isF16())
+      quantMode = FixpipePreQuantMode::F322F16;
+    else if (inType.isF32() && outType.isBF16())
+      quantMode = FixpipePreQuantMode::F322BF16;
+    else if (inType.isInteger(32) && outType.isInteger(8))
+      quantMode = FixpipePreQuantMode::S322I8;
+  }
 
   auto [prodStart, prodEnd] =
       getBlockStartEnd(dep.producerBlockId, module); // C Block
   auto [consStart, consEnd] =
       getBlockStartEnd(dep.consumerBlockId, module); // C Block
 
-  // Adjust consStart to the first operation that actually reads srcValue
+  // Adjust consStart to the first operation that actually reads transferValue
   // within the consumer block, matching the logic in handleVectorToCube.
   if (dep.consumerBlockId == dep.iniConsumerBlockId) {
     auto consumerPoint =
-        analyzeConsumerReadInsertPoint(srcValue, dep.iniConsumerBlockId);
+        analyzeConsumerReadInsertPoint(transferValue, dep.iniConsumerBlockId);
     if (consumerPoint) {
       consStart = consumerPoint;
     }
   }
 
-  auto srcTensorType = cast<RankedTensorType>(srcValue.getType());
-  int64_t M = srcTensorType.getDimSize(0);
-  int64_t N = srcTensorType.getDimSize(1);
-  Type elemType = srcTensorType.getElementType();
+  auto transferTensorType = cast<RankedTensorType>(transferValue.getType());
+  int64_t M = transferTensorType.getDimSize(0);
+  int64_t N = transferTensorType.getDimSize(1);
+  Type elemType = transferTensorType.getElementType();
   auto shape = std::vector<int64_t>{M, N};
 
   int prodBlockId =
-      CVPipeline::getOpBlockId(srcValue.getDefiningOp()).value_or(-1);
+      CVPipeline::getOpBlockId(fixpipeSrcValue.getDefiningOp()).value_or(-1);
   int consBlockId = CVPipeline::getOpBlockId(consStart).value_or(-1);
 
   // Allocate a single shared L1 buffer for producer and consumer.
@@ -1492,16 +1533,24 @@ LogicalResult InterCoreTransferAndSyncPass::handleCubeToCube(
   builder.setInsertionPointAfter(prodEnd);
   auto dmaModeAttr =
       FixpipeDMAModeAttr::get(builder.getContext(), FixpipeDMAMode::NZ2NZ);
-  // FixpipeOp with channel_split=True used at B322B32
+  // FixpipeOp with channel_split=True used when tensor elementType is f32/i32
   static constexpr int32_t alignM = 16;
-  auto numElemPerBlock = mlir::utils::getNumPerBlock(srcTensorType);
+  auto numElemPerBlock = mlir::utils::getNumPerBlock(transferTensorType);
   bool channelSplit = numElemPerBlock == alignM / 2;
+
+  // Build quantModeAttr when a trunc is being folded in as pre_quant.
+  FixpipePreQuantModeAttr quantModeAttr = nullptr;
+  if (quantMode.has_value()) {
+    quantModeAttr =
+        FixpipePreQuantModeAttr::get(builder.getContext(), quantMode.value());
+  }
+
   auto fixpipeOp = builder.create<hivm::FixpipeOp>(
-      loc, mlir::TypeRange{}, srcValue, allocOp->getResult(0),
-      mlir::ValueRange{}, dmaModeAttr, nullptr, nullptr, nullptr, nullptr,
+      loc, mlir::TypeRange{}, fixpipeSrcValue, allocOp->getResult(0),
+      mlir::ValueRange{}, dmaModeAttr, nullptr, nullptr, quantModeAttr, nullptr,
       builder.getBoolAttr(channelSplit), nullptr, mlir::ArrayAttr{}, nullptr);
   attachCommonTags(fixpipeOp, prodBlockId, "CUBE");
-  LOG_DEBUG("[fixpipeOp c->c]: " << *fixpipeOp << "\n");
+  LOG_DEBUG("[fixpipeOp C->C]: " << *fixpipeOp << "\n");
 
   // Consumer side: read L1 buffer via MemorySpaceCast + ToTensor
   builder.setInsertionPoint(consStart);
@@ -1514,14 +1563,19 @@ LogicalResult InterCoreTransferAndSyncPass::handleCubeToCube(
   attachCommonTags(memspaceCastOp, consBlockId, "CUBE");
   attachCommonTags(toTensorOp, consBlockId, "CUBE");
 
-  // Replace uses of srcValue within the consumer block
-  llvm::SmallVector<Operation *> users(srcValue.getUsers().begin(),
-                                       srcValue.getUsers().end());
+  // Replace uses of transferValue within the consumer block
+  llvm::SmallVector<Operation *> users(transferValue.getUsers().begin(),
+                                       transferValue.getUsers().end());
   for (Operation *user : users) {
     auto userBlockIdOpt = CVPipeline::getOpBlockId(user);
     if (userBlockIdOpt && *userBlockIdOpt == dep.iniConsumerBlockId) {
-      user->replaceUsesOfWith(srcValue, toTensorOp.getResult());
+      user->replaceUsesOfWith(transferValue, toTensorOp.getResult());
     }
+  }
+
+  // Erase the trunc op after all uses are replaced (dead code elimination).
+  if (truncOp) {
+    truncOp->erase();
   }
 
   LOG_DEBUG("Inserted C->C fixpipe transfer: block "
@@ -1850,8 +1904,7 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
     if (!isValidC2CMatmulDependency(dep.value)) {
       continue;
     }
-    if (failed(
-            handleCubeToCube(builder, dep, flagManager, flagIdReuseManager))) {
+    if (failed(handleCubeToCube(builder, dep))) {
       LOG_DEBUG("[ERROR] C->C failed! producerBlockId = "
                 << dep.producerBlockId
                 << ", consumerBlockId = " << dep.consumerBlockId << "\n");

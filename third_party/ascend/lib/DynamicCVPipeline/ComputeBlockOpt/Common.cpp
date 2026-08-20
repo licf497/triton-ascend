@@ -24,6 +24,7 @@
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
@@ -268,6 +269,32 @@ bool collectViewOpsAndCheckGlobalMemory(Value viewValue,
     LOG_DEBUG(
         "Subview source defining op is not ViewLikeOpInterface: " << viewValue);
     return false;
+  }
+  return false;
+}
+
+bool isValidTrunc(Operation *op) {
+  // Just filter: arith.truncf(f32->bf16, f32->f16, i32->i8)
+  if (auto truncFOp = dyn_cast<arith::TruncFOp>(op)) {
+    Type inType = truncFOp.getIn().getType();
+    Type outType = truncFOp.getResult().getType();
+    if (auto shapedType = dyn_cast<ShapedType>(inType))
+      inType = shapedType.getElementType();
+    if (auto shapedType = dyn_cast<ShapedType>(outType))
+      outType = shapedType.getElementType();
+
+    return isa<Float32Type>(inType) &&
+           (isa<BFloat16Type>(outType) || isa<Float16Type>(outType));
+  }
+  if (auto truncIOp = dyn_cast<arith::TruncIOp>(op)) {
+    Type inType = truncIOp.getIn().getType();
+    Type outType = truncIOp.getResult().getType();
+    if (auto shapedType = dyn_cast<ShapedType>(inType))
+      inType = shapedType.getElementType();
+    if (auto shapedType = dyn_cast<ShapedType>(outType))
+      outType = shapedType.getElementType();
+
+    return inType.isInteger(32) && outType.isInteger(8);
   }
   return false;
 }
