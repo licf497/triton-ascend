@@ -452,5 +452,27 @@ int getLoopCarriedArgIndex(Value operand, Block *block) {
   return argIdx;
 }
 
+std::optional<hivm::FixpipePreQuantMode> getFixpipePreQuantMode(Operation *op) {
+  if (!isa<arith::TruncFOp, arith::TruncIOp>(op))
+    return std::nullopt;
+
+  // Exclude scalars: only shaped types are valid for fixpipe pre_quant.
+  auto resultType = dyn_cast<ShapedType>(op->getResult(0).getType());
+  if (!resultType)
+    return std::nullopt;
+
+  Type inElemType =
+      cast<ShapedType>(op->getOperand(0).getType()).getElementType();
+  Type outElemType = resultType.getElementType();
+
+  if (isa<Float32Type>(inElemType) && isa<BFloat16Type>(outElemType))
+    return hivm::FixpipePreQuantMode::F322BF16;
+  if (isa<Float32Type>(inElemType) && isa<Float16Type>(outElemType))
+    return hivm::FixpipePreQuantMode::F322F16;
+  if (inElemType.isInteger(32) && outElemType.isInteger(8))
+    return hivm::FixpipePreQuantMode::S322I8;
+  return std::nullopt;
+}
+
 } // namespace CVPipeline
 } // namespace mlir
