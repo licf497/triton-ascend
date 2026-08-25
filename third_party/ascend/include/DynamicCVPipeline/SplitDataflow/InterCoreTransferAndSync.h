@@ -102,6 +102,7 @@ private:
   mlir::ModuleOp module;
   int transferIndex = 0;
   int markAllocIndex = 0;
+  int intraDepsGroupId = 0;
 
   llvm::DenseMap<mlir::Value, mlir::Value> ndnzValueMapping;
   SSBufferManager ssbufferManager;

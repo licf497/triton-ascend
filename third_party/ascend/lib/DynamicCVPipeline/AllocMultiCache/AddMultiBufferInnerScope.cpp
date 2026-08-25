@@ -2107,6 +2107,19 @@ void AddMultiBufferInnerScopePass::runOnOperation() {
 
   OpBuilder builder(module.getContext());
 
+  // Scan existing kIntraDeps to start groupId after the max already used
+  // (e.g. by InterCoreTransferAndSyncPass for C2C fixpipe transfers).
+  int groupId = 0;
+  module.walk([&](Operation *op) {
+    if (auto attr = op->getAttrOfType<ArrayAttr>(CVPipeline::kIntraDeps)) {
+      if (!attr.empty()) {
+        if (auto intAttr = dyn_cast<IntegerAttr>(attr[0])) {
+          groupId = std::max(groupId, static_cast<int>(intAttr.getInt()) + 1);
+        }
+      }
+    }
+  });
+
   LDBG("Enter pass.");
 
   auto walkResult = module.walk([&](scope::ScopeOp scope) -> WalkResult {
@@ -2135,7 +2148,6 @@ void AddMultiBufferInnerScopePass::runOnOperation() {
       return WalkResult::advance();
 
     // Step 4: Process each main_loop
-    int groupId = 0;
     for (Operation *loopOp : mainLoops) {
       MainLoop mainLoop(loopOp);
       if (findNestedMainloop(mainLoop)) {

@@ -1556,6 +1556,10 @@ InterCoreTransferAndSyncPass::handleCubeToCube(OpBuilder &builder,
       builder.getBoolAttr(channelSplit), nullptr, nullptr, mlir::ArrayAttr{},
       nullptr);
   attachCommonTags(fixpipeOp, prodBlockId, CVPipeline::kCoreTypeCube);
+  // Tag C2C fixpipe as kIntraDeps producer.
+  fixpipeOp->setAttr(CVPipeline::kIntraDeps,
+                     builder.getI32ArrayAttr(
+                         {intraDepsGroupId, CVPipeline::crossCoreProducerId}));
   LOG_DEBUG("[fixpipeOp C->C]: " << *fixpipeOp << "\n");
 
   // Consumer side: read L1 buffer via MemorySpaceCast + ToTensor
@@ -1567,6 +1571,11 @@ InterCoreTransferAndSyncPass::handleCubeToCube(OpBuilder &builder,
   auto toTensorOp = builder.create<bufferization::ToTensorOp>(
       loc, targetTensorType, memspaceCastOp.getResult(), true, true);
   attachCommonTags(memspaceCastOp, consBlockId, CVPipeline::kCoreTypeCube);
+  // Tag C2C memspaceCastOp as kIntraDeps consumer.
+  memspaceCastOp->setAttr(
+      CVPipeline::kIntraDeps,
+      builder.getI32ArrayAttr(
+          {intraDepsGroupId, CVPipeline::crossCoreConsumerId}));
   attachCommonTags(toTensorOp, consBlockId, CVPipeline::kCoreTypeCube);
 
   // Replace uses of transferValue within the consumer block.
@@ -1597,6 +1606,7 @@ InterCoreTransferAndSyncPass::handleCubeToCube(OpBuilder &builder,
     truncOp->erase();
   }
 
+  intraDepsGroupId++;
   LOG_DEBUG("Inserted C->C fixpipe transfer: block "
             << dep.producerBlockId << " -> block " << dep.consumerBlockId
             << "\n");
