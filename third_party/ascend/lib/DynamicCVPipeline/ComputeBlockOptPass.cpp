@@ -77,6 +77,7 @@ void ComputeBlockOptPass::runOnOperation() {
   pm.addPass(createMergeSmallBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
 
+  pm.addPass(createMergeComputeBlockPass());
   pm.addPass(createMergeCubeBlockPass());
   pm.addPass(createReorderOpsByBlockIdPass());
 
@@ -115,6 +116,7 @@ void registerComputeBlockOptPasses() {
   registerPass(createPosMaskPatternPass);
   registerPass(createMergeSmallBlockPass);
   registerPass(createSplitIfByBlockIdPass);
+  registerPass(createMergeComputeBlockPass);
   registerPass(createMergeCubeBlockPass);
   registerPass(createRelocateMemrefDeclPass);
 }
