@@ -29,6 +29,7 @@
 #include "ascend/include/DynamicCVPipeline/AllocMultiCache.h"
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/MergeVectorBlock.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
@@ -77,6 +78,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
   pm.addPass(createComputeBlockOptPass());
   pm.addPass(createSplitDataflowPass());
   pm.addPass(createAnalyzeDataFlowPass());
+  pm.addPass(createMergeVectorBlockPass());
   pm.addPass(createAllocMultiCachePass());
   pm.addPass(createAddControlFlowConditionPass());
   pm.addPass(createSeparateMemoryFromComputePass());

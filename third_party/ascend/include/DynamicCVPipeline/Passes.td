@@ -73,6 +73,11 @@ def ComputeBlockOptPass : Pass<"compute-block-id-opt", "mlir::ModuleOp"> {
   let constructor = "triton::createComputeBlockOptPass()";
 }
 
+def MergeVectorBlockPass : Pass<"merge-vector-block", "mlir::ModuleOp"> {
+  let summary = "Merge vector blocks";
+  let constructor = "triton::createMergeVectorBlockPass()";
+}
+
 def RemoveSsbufAttrPass : Pass<"remove-ssbuf-attr", "mlir::ModuleOp"> {
   let summary = "Remove ssbuf attributes";
   let constructor = "triton::createRemoveSsbufAttrPass()";
