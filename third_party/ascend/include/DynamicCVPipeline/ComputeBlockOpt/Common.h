@@ -24,11 +24,14 @@
 #define TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_COMPUTE_BLOCK_OPT_COMMON_H
 
 #include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/Support/LogicalResult.h"
 
 namespace mlir {
 namespace CVPipeline {
@@ -107,6 +110,30 @@ bool collectViewOpsAndCheckGlobalMemory(Value viewValue,
  * @param skip True to request skipping the extra reorder
  */
 void setSkipExtraReorder(ModuleOp module, bool skip);
+
+/// Result of walking a module looking for main loops: the aggregated
+/// CoreType of all visited ops and whether a main loop was already found.
+struct WalkMainLoopResult {
+  CoreType coreType = UNDETERMINED;
+  bool containsMainLoop = false;
+};
+
+/**
+ * @brief Recursively walk @p op looking for "main loop" candidates
+ *
+ * Descends into all nested regions/blocks, aggregating the CoreType of every
+ * visited op. When it encounters an scf.while/scf.for whose aggregated
+ * coreType is CUBE_AND_VECTOR and no main loop has been found yet, invokes
+ * @p pred on that loop op. Fails as soon as @p pred fails.
+ *
+ * @param op Root operation to walk (e.g. a ModuleOp)
+ * @param pred Callback invoked on each detected main loop
+ * @return FailureOr<WalkMainLoopResult> Failure if pred failed, otherwise the
+ * aggregated result
+ */
+llvm::FailureOr<WalkMainLoopResult>
+walkMainLoop(Operation *op,
+             llvm::function_ref<llvm::LogicalResult(Operation *)> pred);
 
 } // namespace CVPipeline
 } // namespace mlir

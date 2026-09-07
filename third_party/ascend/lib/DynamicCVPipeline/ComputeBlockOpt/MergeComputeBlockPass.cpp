@@ -58,17 +58,24 @@ static constexpr const char *DEBUG_TYPE = "merge-compute-block";
 using namespace mlir;
 using namespace triton;
 
+/// Width (in bits) of the sub-block id integer attribute.
+static constexpr int kBlockIdWidth = 32;
+
+/// Inline capacity for sets holding ops cloned to break cross-cube cycles.
+/// Must be a power of two (SmallPtrSet requirement).
+static constexpr unsigned kCloneDepSetInlineSize = 16;
+
 /// Represents a ComputeBlock: a group of ops sharing the same block_id.
 /// Also carries block-level dependency edges: predecessor/successor blocks
 /// and the source ops on incoming cross-block edges.
 struct ComputeBlock {
-  int id;                            // block_id value
-  CVPipeline::CoreType coreType;     // CUBE_ONLY / VECTOR_ONLY
-  SmallVector<Operation *> ops;      // all ops in the group (in IR order)
-  SmallVector<ComputeBlock *> preds; // predecessor ComputeBlocks
-  SmallVector<ComputeBlock *> succs; // successor ComputeBlocks
-  /// Source ops of incoming cross-block edges
-  DenseMap<ComputeBlock *, SmallVector<Operation *>> inEdgeSrcOps{};
+  int id;                         // block_id value
+  CVPipeline::CoreType coreType;  // CUBE_ONLY / VECTOR_ONLY
+  SmallVector<Operation *> ops;   // all ops in the group (in IR order)
+  DenseSet<ComputeBlock *> preds; // predecessor ComputeBlocks (dedup)
+  DenseSet<ComputeBlock *> succs; // successor ComputeBlocks (dedup)
+  /// Source ops of incoming cross-block edges (dedup)
+  DenseMap<ComputeBlock *, DenseSet<Operation *>> inEdgeSrcOps{};
 };
 
 static bool hasTensorResult(const ComputeBlock &blk) {
@@ -113,8 +120,6 @@ static void groupAndBuildGraph(
   // Build dependency graph between ComputeBlocks via DependencyHelper,
   // covering both SSA operands and memory execution dependencies.
   CVPipeline::DependencyHelper helper(memGraph);
-  DenseSet<std::pair<int, int>> seenEdges;
-  DenseSet<std::tuple<int, int, Operation *>> seenDeps;
   for (auto &kv : computeBlocks) {
     ComputeBlock *curBlk = kv.second.get();
     for (Operation *op : curBlk->ops) {
@@ -136,15 +141,11 @@ static void groupAndBuildGraph(
           return WalkResult::advance(); // same ComputeBlock internal edge
         }
 
-        // Record the source op that triggers this cross-block edge
-        if (seenDeps.insert({*ancIdOpt, curBlk->id, src}).second) {
-          curBlk->inEdgeSrcOps[ancBlk].push_back(src);
-        }
-
-        if (seenEdges.insert({*ancIdOpt, curBlk->id}).second) {
-          ancBlk->succs.push_back(curBlk);
-          curBlk->preds.push_back(ancBlk);
-        }
+        // Record the source op that triggers this cross-block edge.
+        // DenseSet dedups automatically.
+        curBlk->inEdgeSrcOps[ancBlk].insert(src);
+        ancBlk->succs.insert(curBlk);
+        curBlk->preds.insert(ancBlk);
         return WalkResult::advance();
       });
     }
@@ -182,25 +183,21 @@ static void collectAllDeps(Operation *startOp,
 
 /// Check if the memref.copy feeding \p toTensor (the copy writing the buffer
 /// consumed by to_tensor) loads its data from global memory (external func
-/// argument).
+/// argument). If no feeding copy is found, the to_tensor itself is
+/// considered to come from global memory.
 static bool
 isToTensorFedByGlobalCopy(bufferization::ToTensorOp toTensor,
                           const CVPipeline::MemoryDependenceGraph &memGraph) {
-  bool foundCopy = false;
   for (Operation *def : memGraph.getMemDefs(toTensor.getOperation())) {
     auto copyOp = dyn_cast<memref::CopyOp>(def);
     if (!copyOp) {
       continue;
     }
-    foundCopy = true;
     SetVector<Operation *> viewOps;
     if (!CVPipeline::collectViewOpsAndCheckGlobalMemory(copyOp.getSource(),
                                                         viewOps)) {
       return false;
     }
-  }
-  if (!foundCopy) {
-    return false;
   }
   return true;
 }
@@ -209,7 +206,8 @@ isToTensorFedByGlobalCopy(bufferization::ToTensorOp toTensor,
 /// only to_tensor ops whose feeding memref.copy loads data from GM (external
 /// func argument).
 static SmallVector<Operation *>
-findToTensorDeps(const ComputeBlock *cubePre, ArrayRef<Operation *> edgeSrcOps,
+findToTensorDeps(const ComputeBlock *cubePre,
+                 const DenseSet<Operation *> &edgeSrcOps,
                  const CVPipeline::MemoryDependenceGraph &memGraph) {
   SmallVector<Operation *> result;
   for (Operation *srcOp : edgeSrcOps) {
@@ -228,10 +226,10 @@ struct CrossCubeCloneRecord {
   SmallVector<Operation *> clonedOps;
   /// (operand, original value) pairs for Cube's original ops whose operands
   /// were remapped to cloned values.
-  SmallVector<std::pair<OpOperand *, Value>> remappedOperands;
+  SmallVector<std::pair<OpOperand *, Value>> operandOriginalValues;
 
   void rollback(CVPipeline::ComputeBlockIdManager &bm) {
-    for (auto &[operand, origValue] : remappedOperands) {
+    for (auto &[operand, origValue] : operandOriginalValues) {
       operand->set(origValue);
     }
     for (Operation *op : llvm::reverse(clonedOps)) {
@@ -239,47 +237,39 @@ struct CrossCubeCloneRecord {
       op->erase();
     }
     clonedOps.clear();
-    remappedOperands.clear();
+    operandOriginalValues.clear();
   }
 };
 
 /// Clone ops from CubePre into Cube at the front of Cube's ops.
 /// Selected ops must be in CubePre and are in `toClone`.
 static void cloneOpCrossCubeDep(
-    int cubePreId, int cubeId, const SmallPtrSet<Operation *, 16> &toClone,
-    const DenseMap<int, std::unique_ptr<ComputeBlock>> &computeBlocks,
+    const ComputeBlock *cubePre, const ComputeBlock *cube,
+    const SmallPtrSet<Operation *, kCloneDepSetInlineSize> &toClone,
     CVPipeline::ComputeBlockIdManager &bm, CrossCubeCloneRecord &record) {
-  auto cubePreIt = computeBlocks.find(cubePreId);
-  auto cubeIt = computeBlocks.find(cubeId);
-  if (cubePreIt == computeBlocks.end() || cubeIt == computeBlocks.end()) {
-    return;
-  }
-  ComputeBlock *cubePreBlock = cubePreIt->second.get();
-  ComputeBlock *cubeBlock = cubeIt->second.get();
-
-  if (cubeBlock->ops.empty()) {
+  if (cube->ops.empty()) {
     return;
   }
 
-  Operation *insertBefore = cubeBlock->ops.front();
+  Operation *insertBefore = cube->ops.front();
   OpBuilder builder(insertBefore);
   IRMapping mapper;
-  for (Operation *op : cubePreBlock->ops) {
+  for (Operation *op : cubePre->ops) {
     if (!toClone.contains(op)) {
       continue;
     }
     Operation *cloned = builder.clone(*op, mapper);
     record.clonedOps.push_back(cloned);
     cloned->walk(
-        [&](Operation *innerOp) { bm.updateBlockId(innerOp, cubeId); });
+        [&](Operation *innerOp) { bm.updateBlockId(innerOp, cube->id); });
   }
 
   // Remap Cube's original ops' operands: replace references to old CubePre
   // values with the corresponding cloned values now in Cube.
-  for (Operation *op : cubeBlock->ops) {
+  for (Operation *op : cube->ops) {
     for (auto &operand : op->getOpOperands()) {
       if (Value mapped = mapper.lookupOrNull(operand.get())) {
-        record.remappedOperands.emplace_back(&operand, operand.get());
+        record.operandOriginalValues.emplace_back(&operand, operand.get());
         operand.set(mapped);
       }
     }
@@ -293,34 +283,33 @@ static void cloneOpCrossCubeDep(
 static SmallVector<std::pair<ComputeBlock *, ComputeBlock *>>
 collectVectorMergeEdges(
     const DenseMap<int, std::unique_ptr<ComputeBlock>> &computeBlocks) {
-  auto hasCubeNeighbor = [](ArrayRef<ComputeBlock *> neighbors) {
+  auto hasCubeNeighbor = [](const auto &neighbors) {
     return llvm::any_of(neighbors, [](const ComputeBlock *nb) {
       return nb->coreType == CVPipeline::CoreType::CUBE_ONLY;
     });
   };
 
   // Collect VECTOR_ONLY candidate blocks
-  SmallVector<ComputeBlock *> vecCandidates;
+  DenseSet<ComputeBlock *> vecCandidates;
   for (auto &kv : computeBlocks) {
-    ComputeBlock *blk = kv.second.get();
-    if (blk->coreType != CVPipeline::CoreType::VECTOR_ONLY)
+    ComputeBlock &blk = *kv.second;
+    if (blk.coreType != CVPipeline::CoreType::VECTOR_ONLY)
       continue;
-    if (!hasTensorResult(*blk))
+    if (!hasTensorResult(blk))
       continue;
 
     // Must have both a CUBE predecessor and a CUBE successor
-    if (!hasCubeNeighbor(blk->succs) || !hasCubeNeighbor(blk->preds))
+    if (!hasCubeNeighbor(blk.succs) || !hasCubeNeighbor(blk.preds))
       continue;
 
-    if (!llvm::is_contained(vecCandidates, blk))
-      vecCandidates.push_back(blk);
+    vecCandidates.insert(&blk);
   }
 
   // Collect ALL adjacent edges between candidates as merge candidates
   SmallVector<std::pair<ComputeBlock *, ComputeBlock *>> edges;
   for (ComputeBlock *cand : vecCandidates) {
     for (ComputeBlock *succ : cand->succs) {
-      if (llvm::is_contained(vecCandidates, succ)) {
+      if (vecCandidates.contains(succ)) {
         edges.emplace_back(cand, succ);
       }
     }
@@ -343,70 +332,57 @@ static void markSubBlock(const ComputeBlock &predV, const ComputeBlock &succV) {
   for (const ComputeBlock *blk : {&predV, &succV}) {
     for (Operation *op : blk->ops) {
       int curId = CVPipeline::getOpBlockId(op).value_or(blk->id);
-      op->setAttr(CVPipeline::kSubBlock, builder.getI32IntegerAttr(curId));
+      op->setAttr(
+          CVPipeline::kSubBlock,
+          IntegerAttr::get(IntegerType::get(op->getContext(), kBlockIdWidth),
+                           curId));
     }
   }
-}
-
-/// Step 3: Try to directly merge succV into predV.
-/// Returns true if merge succeeded.
-static bool tryDirectMerge(const CVPipeline::MemoryDependenceGraph &memGraph,
-                           const ComputeBlock &predV, const ComputeBlock &succV,
-                           CVPipeline::ComputeBlockIdManager &bm) {
-  if (willCreateCycle(succV.ops, memGraph, predV.id, bm))
-    return false;
-  LOG_DEBUG("Successfully direct merge: " << succV.id << " -> " << predV.id);
-
-  // Mark sub-block for insert sync in splitDataFlow.
-  markSubBlock(predV, succV);
-  for (Operation *op : succV.ops)
-    bm.updateBlockId(op, predV.id);
-  return true;
 }
 
 /// Collect the ops in CubePre that the given to_tensor ops transitively
 /// depend on (via SSA use-def chains, memory execution predecessors, and
 /// ops nested in regions). These are the ops that need to be cloned to Cube
 /// to break the cycle.
-static SmallPtrSet<Operation *, 16>
+static SmallPtrSet<Operation *, kCloneDepSetInlineSize>
 collectDepOpsInCubePre(const ComputeBlock &cubePre,
                        ArrayRef<Operation *> toTensorOps,
                        const CVPipeline::MemoryDependenceGraph &memGraph) {
-  SmallPtrSet<Operation *, 16> opsToClone;
-  SmallPtrSet<Operation *, 16> visited;
+  SmallPtrSet<Operation *, kCloneDepSetInlineSize> opsToClone;
+  SmallPtrSet<Operation *, kCloneDepSetInlineSize> depOps;
   for (Operation *toTensor : toTensorOps) {
-    collectAllDeps(toTensor, memGraph, visited);
+    collectAllDeps(toTensor, memGraph, depOps);
   }
-  for (Operation *op : visited) {
+  for (Operation *op : depOps) {
     if (llvm::is_contained(cubePre.ops, op))
       opsToClone.insert(op);
   }
   return opsToClone;
 }
 
-/// Step 4: Try cross-Cube clone to break the cycle, then merge.
-/// Returns true if merge succeeded after clone.
-static bool tryCrossCubeCloneMerge(
-    Block *block,
-    const DenseMap<int, std::unique_ptr<ComputeBlock>> &computeBlocks,
-    const ComputeBlock &predV, const ComputeBlock &succV,
-    const CVPipeline::MemoryDependenceGraph &memGraph,
-    CVPipeline::ComputeBlockIdManager &bm) {
-  // 4a. Find succV's CUBE predecessor (Cube)
+/// Steps 4a-4d: look for the CubePre → Cube clone opportunity and perform
+/// the clone. Returns false (without cloning) if any prerequisite along the
+/// way is missing.
+static bool
+tryCloneFromCubePre(const ComputeBlock &succV,
+                    const CVPipeline::MemoryDependenceGraph &memGraph,
+                    CVPipeline::ComputeBlockIdManager &bm,
+                    CrossCubeCloneRecord &record) {
+  // a. Find succV's CUBE predecessor (Cube)
   ComputeBlock *cube = findCubePred(succV);
   if (!cube) {
     LOG_DEBUG("succV " << succV.id << " has no CUBE predecessor");
     return false;
   }
 
-  // 4b. Find Cube's CUBE predecessor (CubePre)
+  // b. Find Cube's CUBE predecessor (CubePre)
   ComputeBlock *cubePre = findCubePred(*cube);
   if (!cubePre) {
     LOG_DEBUG("Cube " << cube->id << " has no CUBE predecessor");
     return false;
   }
 
-  // 4c. Check if Cube depends on CubePre via to_tensor whose feeding
+  // c. Check if Cube depends on CubePre via to_tensor whose feeding
   // memref.copy loads data from GM (external func argument).
   SmallVector<Operation *> toTensorOps;
   auto edgeIt = cube->inEdgeSrcOps.find(cubePre);
@@ -415,30 +391,39 @@ static bool tryCrossCubeCloneMerge(
   }
   if (toTensorOps.empty()) {
     LOG_DEBUG("Cube(" << cube->id << ") depends on CubePre(" << cubePre->id
-                      << ") not for load data, skipping");
+                      << ") not for load data, skipping clone");
     return false;
   }
 
-  // 4d. Trace back all transitive dependencies of the to_tensor ops and
-  // keep the ones in CubePre; they will be cloned to Cube.
-  SmallPtrSet<Operation *, 16> opsToClone =
+  // d. Trace back all transitive dependencies of the to_tensor ops and
+  // keep the ones in CubePre; clone them to Cube.
+  SmallPtrSet<Operation *, kCloneDepSetInlineSize> opsToClone =
       collectDepOpsInCubePre(*cubePre, toTensorOps, memGraph);
+  cloneOpCrossCubeDep(cubePre, cube, opsToClone, bm, record);
+  return true;
+}
 
+/// Step 3: Try to merge succV into predV.
+/// Returns true if merge succeeded.
+static bool
+tryCrossCubeCloneMerge(const ComputeBlock &predV, const ComputeBlock &succV,
+                       const CVPipeline::MemoryDependenceGraph &memGraph,
+                       CVPipeline::ComputeBlockIdManager &bm) {
   CrossCubeCloneRecord cloneRecord;
-  cloneOpCrossCubeDep(cubePre->id, cube->id, opsToClone, computeBlocks, bm,
-                      cloneRecord);
+  bool cloned = tryCloneFromCubePre(succV, memGraph, bm, cloneRecord);
 
-  // 4e. Re-check cycle after cloning; roll back the clone on failure.
+  // Check cycle (with the clone applied, if any); roll back the clone
+  // on failure.
   if (willCreateCycle(succV.ops, memGraph, predV.id, bm)) {
     cloneRecord.rollback(bm);
-    LOG_DEBUG("Still creates cycle after cross-Cube clone "
-              "for VECTOR "
+    LOG_DEBUG("Merge still creates cycle"
+              << (cloned ? " after cross-Cube clone" : "") << " for VECTOR "
               << predV.id << " -> " << succV.id);
     return false;
   }
 
-  LOG_DEBUG("Successfully merge after cross-Cube clone: " << succV.id << " -> "
-                                                          << predV.id);
+  LOG_DEBUG("Successfully merge" << (cloned ? " after cross-Cube clone" : "")
+                                 << ": " << succV.id << " -> " << predV.id);
 
   // Mark sub-block for insert sync in splitDataFlow.
   markSubBlock(predV, succV);
@@ -447,15 +432,15 @@ static bool tryCrossCubeCloneMerge(
   return true;
 }
 
-static void tryMergeInBlock(Block *mainLoop,
+static bool tryMergeInBlock(Block *mainLoop,
                             CVPipeline::ComputeBlockIdManager &bm,
-                            const CVPipeline::MemoryDependenceGraph &memGraph,
-                            bool &anyMerged) {
+                            const CVPipeline::MemoryDependenceGraph &memGraph) {
+  bool anyMerged = false;
   // Step 1: Group and build dependency graph (block_id → ComputeBlock)
   DenseMap<int, std::unique_ptr<ComputeBlock>> computeBlocks;
   groupAndBuildGraph(mainLoop, memGraph, computeBlocks);
   if (computeBlocks.empty())
-    return;
+    return anyMerged;
 
   // Step 2: Collect merge candidate edges between VECTOR blocks
   SmallVector<std::pair<ComputeBlock *, ComputeBlock *>> edgeCandidates =
@@ -463,18 +448,16 @@ static void tryMergeInBlock(Block *mainLoop,
 
   while (!edgeCandidates.empty()) {
     // Pop the next VECTOR pair to process from the candidate set.
-    ComputeBlock *predV = edgeCandidates.front().first;
-    ComputeBlock *succV = edgeCandidates.front().second;
-    edgeCandidates.erase(edgeCandidates.begin());
+    std::pair<ComputeBlock *, ComputeBlock *> edge =
+        edgeCandidates.pop_back_val();
+    ComputeBlock *predV = edge.first;
+    ComputeBlock *succV = edge.second;
 
     LOG_DEBUG("Trying VECTOR edge: predV=" << predV->id
                                            << ", succV=" << succV->id);
 
-    // Step 3: Try direct merge; Step 4: try cross-Cube clone merge.
-    // Failure of a single edge only skips that edge.
-    bool merged = tryDirectMerge(memGraph, *predV, *succV, bm) ||
-                  tryCrossCubeCloneMerge(mainLoop, computeBlocks, *predV,
-                                         *succV, memGraph, bm);
+    // Step 3: Try to merge
+    bool merged = tryCrossCubeCloneMerge(*predV, *succV, memGraph, bm);
     if (merged) {
       anyMerged = true;
       // Remove all remaining edges touching the merged blocks: they can
@@ -486,6 +469,7 @@ static void tryMergeInBlock(Block *mainLoop,
                      });
     }
   }
+  return anyMerged;
 }
 
 namespace {
@@ -526,8 +510,8 @@ public:
 
     SmallVector<Block *> mainLoops;
     llvm::LogicalResult walkResult =
-        CVPipeline::SplitIf::walkMainLoop(module, [&](Operation *loop) {
-          mainLoops.push_back(&loop->getRegion(0).front());
+        CVPipeline::walkMainLoop(module, [&](Operation *loop) {
+          mainLoops.push_back(CVPipeline::MainLoop(loop).getBody());
           return success();
         });
     if (failed(walkResult)) {
@@ -540,8 +524,8 @@ public:
     CVPipeline::ComputeBlockIdManager bm(module);
     bool anyMerged = false;
     for (Block *mainLoop : mainLoops) {
-      LOG_DEBUG("try merge in LoopBlock");
-      tryMergeInBlock(mainLoop, bm, memGraph, anyMerged);
+      LOG_DEBUG("try merge in LoopBlock: " << *mainLoop);
+      anyMerged |= tryMergeInBlock(mainLoop, bm, memGraph);
     }
 
     // Request ReorderOpsByBlockIdPass to skip the extra reorder when this
