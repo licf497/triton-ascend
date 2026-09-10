@@ -63,6 +63,8 @@ struct DependencyInfo {
   mlir::Operation *nextOp;
   // Optional Items for iterarg yield dependency
   mlir::Operation *consumerYieldOp = nullptr;
+
+  mlir::OpOperand *operand = nullptr;
 };
 
 class DataDependencyInfo {
@@ -92,6 +94,9 @@ public:
   llvm::SmallVector<DependencyInfo> &getMemoryDependencies() {
     return memoryDependencies;
   }
+  llvm::SmallVector<DependencyInfo> &getIntraC2CDependencies() {
+    return intraC2CDependencies;
+  }
 
   void setValid(bool v) { valid = v; }
 
@@ -102,6 +107,7 @@ private:
   llvm::SmallVector<DependencyInfo> c2vDependencies;
   llvm::SmallVector<DependencyInfo> c2cDependencies;
   llvm::SmallVector<DependencyInfo> memoryDependencies;
+  llvm::SmallVector<DependencyInfo> intraC2CDependencies;
 };
 
 // Define pass
@@ -147,6 +153,8 @@ private:
                          mlir::Operation *predOp, mlir::Operation *nextOp);
   void analyzeExternalInputs(DataDependencyInfo &info);
   void analyzeExternalOutputs(DataDependencyInfo &info);
+
+  void analyzeInternalDeps(DataDependencyInfo &info);
 
   void analyzeMemoryEffect(DataDependencyInfo &info);
   std::pair<int, int> findCommonLevelBlockIds(DataDependencyInfo &info,
