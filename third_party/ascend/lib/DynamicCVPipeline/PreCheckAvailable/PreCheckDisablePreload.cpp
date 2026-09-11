@@ -39,7 +39,6 @@ using namespace triton;
 static const llvm::SmallVector<llvm::StringRef> kBlacklistFuncNames = {
     "_attn_fwd",
     "kernel_sdpa_fwd",
-    "kernel_sdpa_bwd_q",
     "_swa_paged_decode_kernel",
     "_mqa_logits_kernel",
     "chunk_fwd_kernel_h",

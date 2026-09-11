@@ -145,13 +145,6 @@ static std::optional<int> getSubBlockId(Operation *op) {
   return attr.getInt();
 }
 
-/// Set the sub-block tag of \p op to \p subBlockId.
-static void setSubBlockId(Operation *op, int subBlockId) {
-  MLIRContext *ctx = op->getContext();
-  op->setAttr(CVPipeline::kSubBlock,
-              IntegerAttr::get(IntegerType::get(ctx, 32), subBlockId));
-}
-
 static bool isChannelSplitNeeded(RankedTensorType tensorType) {
   static constexpr int32_t alignM = 16;
   return mlir::utils::getNumPerBlock(tensorType) == alignM / 2;
@@ -759,7 +752,7 @@ Operation *InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(
     // Propagate the sub-block tag from the src defining op to the copy op.
     if (Operation *srcDefOp = srcValue.getDefiningOp()) {
       if (auto subBlockId = getSubBlockId(srcDefOp)) {
-        setSubBlockId(copyOp, *subBlockId);
+        CVPipeline::setSubBlockId(copyOp, *subBlockId);
       }
     }
     LOG_DEBUG("[copyOp]: " << *copyOp << "\n");
@@ -1028,7 +1021,7 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
                      transferIndex);
   // Propagate the sub-block tag from transferOp to the sync ops.
   if (auto subBlockId = getSubBlockId(transferOp)) {
-    setSubBlockId(setOpForRead, *subBlockId);
+    CVPipeline::setSubBlockId(setOpForRead, *subBlockId);
   }
 
   builder.setInsertionPoint(consumerStartOp);
@@ -1068,7 +1061,7 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
                        transferIndex);
 
     if (auto subBlockId = getSubBlockId(transferOp)) {
-      setSubBlockId(waitOpForWrite, *subBlockId);
+      CVPipeline::setSubBlockId(waitOpForWrite, *subBlockId);
     }
 
     attachAnalyzeFlagIdTag(setOpForRead);
