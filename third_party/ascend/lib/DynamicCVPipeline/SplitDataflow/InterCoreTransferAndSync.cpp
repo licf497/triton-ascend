@@ -503,6 +503,9 @@ void InterCoreTransferAndSyncPass::Nd2NzNormalize(OpBuilder &builder,
   auto typeTrans = RankedTensorType::get(shapeTrans, elemType);
   auto typeFinal = RankedTensorType::get(shapeFinal, elemType);
 
+  Operation *origDefOp = origValue.getDefiningOp();
+  std::optional<int> subBlockId = getSubBlockId(origDefOp);
+
   auto [newProdStart, newProdEnd] =
       getBlockStartEnd(dep.producerBlockId, module);
   if (dep.iniProducerBlockId == dep.producerBlockId) {
@@ -511,10 +514,9 @@ void InterCoreTransferAndSyncPass::Nd2NzNormalize(OpBuilder &builder,
     if (producerPoint) {
       newProdEnd = producerPoint;
     }
-    if (Operation *origDefOp = origValue.getDefiningOp()) {
-      if (getSubBlockId(origDefOp)) {
-        newProdEnd = origDefOp;
-      }
+    if (subBlockId) {
+      if (Operation *subBlockEnd = getSubBlockStartEnd(origDefOp).second)
+        newProdEnd = subBlockEnd;
     }
   }
   builder.setInsertionPointAfter(newProdEnd);
@@ -539,6 +541,14 @@ void InterCoreTransferAndSyncPass::Nd2NzNormalize(OpBuilder &builder,
   attachCommonTags(transposeOp, originBlockId, CVPipeline::kCoreTypeVector);
   attachCommonTags(reshape4Dcst, originBlockId, CVPipeline::kCoreTypeVector);
   attachCommonTags(reshape4DOp, originBlockId, CVPipeline::kCoreTypeVector);
+  if (subBlockId) {
+    CVPipeline::setSubBlockId(reshape3Dcst, *subBlockId);
+    CVPipeline::setSubBlockId(reshape3DOp, *subBlockId);
+    CVPipeline::setSubBlockId(emptyTrans, *subBlockId);
+    CVPipeline::setSubBlockId(transposeOp, *subBlockId);
+    CVPipeline::setSubBlockId(reshape4Dcst, *subBlockId);
+    CVPipeline::setSubBlockId(reshape4DOp, *subBlockId);
+  }
   LOG_DEBUG("[reshape3DOp]: " << *reshape3DOp << "\n");
   LOG_DEBUG("[transposeOp]: " << *transposeOp << "\n");
   LOG_DEBUG("[reshape4DOp]: " << *reshape4DOp << "\n");
@@ -1540,10 +1550,10 @@ LogicalResult InterCoreTransferAndSyncPass::handleVectorToCube(
     if (producerPoint) {
       prodEnd = producerPoint;
     }
-    if (Operation *srcDefOp = srcValue.getDefiningOp()) {
-      if (getSubBlockId(srcDefOp)) {
-        prodEnd = normalizedVal.getDefiningOp();
-      }
+    if (Operation *srcDefOp = srcValue.getDefiningOp();
+        srcDefOp && getSubBlockId(srcDefOp)) {
+      if (Operation *subBlockEnd = getSubBlockStartEnd(srcDefOp).second)
+        prodEnd = subBlockEnd;
     }
   }
   LOG_DEBUG("after analyzeConsumerReadInsertPoint\n");
