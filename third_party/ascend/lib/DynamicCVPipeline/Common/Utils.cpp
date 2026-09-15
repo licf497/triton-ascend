@@ -506,7 +506,7 @@ std::optional<hivm::FixpipePreQuantMode> getFixpipePreQuantMode(Operation *op) {
   return std::nullopt;
 }
 
-Operation *skipC2CIntermediateOps(Value operand) {
+Operation *getSourceThroughCIntermediateOps(Value operand) {
   auto isIntermediateOp = [](Operation *op) {
     return getFixpipePreQuantMode(op).has_value();
   };

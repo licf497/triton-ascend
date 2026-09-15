@@ -329,7 +329,7 @@ getFixpipePreQuantMode(Operation *truncOp);
 
 // Trace an operand's defining op back through C2C intermediate ops to find the
 // underlying producing op. Returns null when the operand has no defining op.
-Operation *skipC2CIntermediateOps(Value operand);
+Operation *getSourceThroughCIntermediateOps(Value operand);
 
 } // namespace CVPipeline
 } // namespace mlir

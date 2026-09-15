@@ -55,8 +55,8 @@ static linalg::MatmulOp getSharedInputInitProducer(linalg::MatmulOp consumer) {
   }
   for (Value input : consumer.getDpsInputs()) {
     auto inputProducer = dyn_cast_if_present<linalg::MatmulOp>(
-        CVPipeline::skipC2CIntermediateOps(input));
-    if (inputProducer.getOperation() == initProducer.getOperation()) {
+        CVPipeline::getSourceThroughCIntermediateOps(input));
+    if (inputProducer == initProducer) {
       return initProducer;
     }
   }
@@ -65,21 +65,22 @@ static linalg::MatmulOp getSharedInputInitProducer(linalg::MatmulOp consumer) {
 
 // Merge the ops of consumerBlockId into producerBlockId when it does not
 // create a cycle.
-static bool tryMergeBlocks(int consumerBlockId, int producerBlockId,
-                           const CVPipeline::MemoryDependenceGraph &memGraph,
-                           CVPipeline::ComputeBlockIdManager &bm) {
+static LogicalResult
+tryMergeBlocks(int consumerBlockId, int producerBlockId,
+               const CVPipeline::MemoryDependenceGraph &memGraph,
+               CVPipeline::ComputeBlockIdManager &bm) {
   llvm::SmallVector<Operation *> consumerOps =
       bm.getOpsByBlockId(consumerBlockId);
   if (consumerOps.empty() ||
       CVPipeline::willCreateCycle(consumerOps, memGraph, producerBlockId, bm)) {
-    return false;
+    return failure();
   }
   LOG_DEBUG("Merging block " << consumerBlockId << " into block "
                              << producerBlockId);
   for (Operation *op : consumerOps) {
     bm.updateBlockId(op, producerBlockId);
   }
-  return true;
+  return success();
 }
 
 class MergeInputInitSharedCubeBlockPass
@@ -121,14 +122,15 @@ public:
         continue;
       }
 
-      auto producerBlockId = CVPipeline::getOpBlockId(producer.getOperation());
-      auto consumerBlockId = CVPipeline::getOpBlockId(consumer.getOperation());
+      auto producerBlockId = CVPipeline::getOpBlockId(producer);
+      auto consumerBlockId = CVPipeline::getOpBlockId(consumer);
       if (!producerBlockId || !consumerBlockId ||
           *producerBlockId == *consumerBlockId) {
         continue;
       }
 
-      if (!tryMergeBlocks(*consumerBlockId, *producerBlockId, memGraph, bm)) {
+      if (failed(tryMergeBlocks(*consumerBlockId, *producerBlockId, memGraph,
+                                bm))) {
         LOG_DEBUG("[error] matmul result in block_id = "
                   << *producerBlockId
                   << " is used by other ops and create cycle after merge");

@@ -854,13 +854,13 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
 // Trace an operand's defining op back to find the source matmul.
 static linalg::MatmulOp resolveSameBlockMatmulProducer(mlir::Value operand,
                                                        int consumerBlockId) {
-  Operation *defOp = CVPipeline::skipC2CIntermediateOps(operand);
+  Operation *defOp = CVPipeline::getSourceThroughCIntermediateOps(operand);
 
   auto producer = dyn_cast_if_present<linalg::MatmulOp>(defOp);
   if (!producer) {
     return nullptr;
   }
-  auto producerBlockIdOpt = CVPipeline::getOpBlockId(producer.getOperation());
+  auto producerBlockIdOpt = CVPipeline::getOpBlockId(producer);
   if (!producerBlockIdOpt || *producerBlockIdOpt != consumerBlockId) {
     return nullptr;
   }

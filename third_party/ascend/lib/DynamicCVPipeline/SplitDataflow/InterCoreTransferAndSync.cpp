@@ -184,7 +184,7 @@ static bool hasAnyMatmulABInputUser(Value value, int consumerBlockId) {
 /// Valid chains: matmul -> (intermediate_op)* -> matmul.
 static bool isValidC2CMatmulDependency(Value value, int consumerBlockId) {
   // Walk back through valid intermediate ops to find the source matmul.
-  Operation *defOp = CVPipeline::skipC2CIntermediateOps(value);
+  Operation *defOp = CVPipeline::getSourceThroughCIntermediateOps(value);
 
   if (!isa_and_nonnull<linalg::MatmulOp>(defOp))
     return false;
