@@ -510,6 +510,7 @@ processBlockWithCubeBFS(Block *block, const DependencyHelper &depHelper,
     auto temBlockId = bm.getNextId();
     llvm::SmallVector<Operation *> dotSeeds =
         matchSeed(dot, bm, depHelper.memGraph);
+        // 需要细看
     // Drop seeds straddling a sync relative to the dot: they belong to their
     // own segment and Phase 2 hands them a separate id, so the seed group can
     // never appear on both sides of the barrier.
@@ -544,7 +545,7 @@ processBlockWithCubeBFS(Block *block, const DependencyHelper &depHelper,
 
   // Phase 2: Handle remaining Cube Ops following Topo order
   TopologicalPartitionPlanner topoPlanner{block, assigned, depHelper, bm, wall};
-  if (failed(topoPlanner.run())) {
+  if (failed(topoPlanner.run())) { //怎么根据拓扑序切分组？？
     return failure();
   }
   fuseMarkOpToDef(block, bm, depHelper, wall);

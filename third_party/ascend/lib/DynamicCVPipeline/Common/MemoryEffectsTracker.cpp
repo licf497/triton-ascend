@@ -127,6 +127,53 @@ bool isKnownNoMemoryEffectCall(Operation *op) {
                     callOp.getCallee().starts_with("triton_stride_load"));
 }
 
+// Like mlir::getEffectsRecursively, but models func::CallOp (which implements
+// neither MemoryEffectOpInterface nor HasRecursiveMemoryEffects) the same way
+// as a directly analyzed call in collectOuterEffects: a Write on every memref
+// operand (after view-source normalization). Without this, any region op
+// (e.g. scf.if / scf.for) containing a call would degrade into an unknown
+// memory barrier that depends on and invalidates every memory slot.
+static std::optional<SmallVector<MemoryEffects::EffectInstance>>
+getEffectsRecursivelyWithCalls(Operation *rootOp) {
+  SmallVector<MemoryEffects::EffectInstance> effects;
+  SmallVector<Operation *> effectingOps(1, rootOp);
+  while (!effectingOps.empty()) {
+    Operation *op = effectingOps.pop_back_val();
+
+    // If the operation has recursive effects, push all of the nested
+    // operations on to the stack to consider.
+    bool hasRecursiveEffects =
+        op->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
+    if (hasRecursiveEffects) {
+      for (Region &region : op->getRegions()) {
+        for (Block &block : region) {
+          for (Operation &nestedOp : block) {
+            effectingOps.push_back(&nestedOp);
+          }
+        }
+      }
+    }
+
+    if (auto effectInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
+      effectInterface.getEffects(effects);
+    } else if (auto callOp = dyn_cast<func::CallOp>(op)) {
+      for (Value arg : callOp.getOperands()) {
+        Value source = getViewSource(arg);
+        if (!isa<BaseMemRefType>(source.getType())) {
+          continue;
+        }
+        MemoryEffects::EffectInstance scopedWrite(MemoryEffects::Write::get());
+        effects.push_back(remapEffectValue(scopedWrite, source));
+      }
+    } else if (!hasRecursiveEffects) {
+      // The operation does not have recursive memory effects or implement
+      // the memory effect op interface. Its effects are unknown.
+      return std::nullopt;
+    }
+  }
+  return effects;
+}
+
 bool shouldAnalyzeAsLeaf(Operation *op) {
   return op->getNumRegions() == 0 || isa<linalg::LinalgOp>(op);
 }
@@ -303,27 +350,13 @@ void MemoryDependenceGraph::analyzeRegionsOf(Operation *op) {
   }
 }
 
-SmallVector<MemoryEffects::EffectInstance>
-MemoryDependenceGraph::collectOuterEffects(Operation *op, bool &unknown,
-                                           bool recursive) {
-  unknown = false;
+using EffectsTy = SmallVector<MemoryEffects::EffectInstance>;
 
-  if (auto markOp = dyn_cast<annotation::MarkOp>(op)) {
-    if (markOp->hasAttr(CVPipeline::kInlinableQuantScaleAttr)) {
-      return {};
-    } else {
-      MemoryEffects::EffectInstance scopedWrite(MemoryEffects::Write::get());
-      return {remapEffectValue(scopedWrite, markOp.getSrc())};
-    }
-  }
-
-  if (auto allocTensorOp = dyn_cast<bufferization::AllocTensorOp>(op)) {
-    return {};
-  }
-
+static EffectsTy collectOuterEffectsDefault(Operation *op, bool &unknown,
+                                            bool recursive) {
   std::optional<SmallVector<MemoryEffects::EffectInstance>> raw;
   if (recursive) {
-    raw = getEffectsRecursively(op);
+    raw = getEffectsRecursivelyWithCalls(op);
   } else if (auto effectInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
     raw.emplace();
     effectInterface.getEffects(*raw);
@@ -351,6 +384,49 @@ MemoryDependenceGraph::collectOuterEffects(Operation *op, bool &unknown,
     filtered.push_back(source == value ? e : remapEffectValue(e, source));
   }
   return filtered;
+}
+
+EffectsTy MemoryDependenceGraph::collectOuterEffects(Operation *op,
+                                                     bool &unknown,
+                                                     bool recursive) {
+  unknown = false;
+
+  return llvm::TypeSwitch<Operation *, EffectsTy>(op)
+      .Case([](annotation::MarkOp markOp) -> EffectsTy {
+        if (markOp->hasAttr(CVPipeline::kInlinableQuantScaleAttr)) {
+          return {};
+        }
+        MemoryEffects::EffectInstance scopedWrite(MemoryEffects::Write::get());
+        return {remapEffectValue(scopedWrite, markOp.getSrc())};
+      })
+      .Case([](bufferization::AllocTensorOp) { return EffectsTy{}; })
+      .Case([](bufferization::ToTensorOp toTensorOp) -> EffectsTy {
+        MemoryEffects::EffectInstance scopedWrite(MemoryEffects::Read::get());
+        return {remapEffectValue(scopedWrite, toTensorOp.getBuffer())};
+      })
+      .Case([](func::CallOp callOp) -> EffectsTy {
+        EffectsTy effects;
+        for (Value arg : callOp.getOperands()) {
+          Value source = getViewSource(arg);
+          if (!isa<BaseMemRefType>(source.getType())) {
+            continue;
+          }
+          MemoryEffects::EffectInstance scopedWrite(MemoryEffects::Write::get());
+          effects.push_back(remapEffectValue(scopedWrite, source));
+        }
+        return effects;
+      })
+      .Case([&](hivm::CustomOp customOp) -> EffectsTy {
+        // return {};
+        auto res = collectOuterEffectsDefault(customOp, unknown, recursive);
+        if (unknown) {
+          llvm::errs() << "Unknown: " << customOp << "\n";
+        }
+        return res;
+      })
+      .Default([&](Operation *op) {
+        return collectOuterEffectsDefault(op, unknown, recursive);
+      });
 }
 
 AliasResult MemoryDependenceGraph::queryAlias(Value lhs, Value rhs) {
