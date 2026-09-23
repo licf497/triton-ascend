@@ -152,16 +152,6 @@ static void groupAndBuildGraph(
   }
 }
 
-/// Find the first CUBE predecessor of a given ComputeBlock.
-static ComputeBlock *findCubePred(const ComputeBlock &blk) {
-  for (ComputeBlock *p : blk.preds) {
-    if (p->coreType == CVPipeline::CoreType::CUBE_ONLY) {
-      return p;
-    }
-  }
-  return nullptr;
-}
-
 /// Collect all transitive dependencies of \p startOp via SSA use-def chains,
 /// memory execution predecessors, and ops nested in regions. Results are
 /// accumulated into \p collected (including \p startOp itself).
@@ -276,15 +266,26 @@ static void cloneOpCrossCubeDep(
   }
 }
 
+/// Return the first CUBE_ONLY block among the given predecessor/successor
+/// neighbors, or nullptr if none exists.
+static ComputeBlock *
+findCubeNeighbor(const DenseSet<ComputeBlock *> &neighbors) {
+  for (ComputeBlock *nb : neighbors) {
+    if (nb->coreType == CVPipeline::CoreType::CUBE_ONLY)
+      return nb;
+  }
+  return nullptr;
+}
+
 /// Step 2: Collect merge candidate edges (predV → succV) between
-/// VECTOR_ONLY blocks. A candidate block must have tensor results, both a
-/// CUBE predecessor and a CUBE successor. Edges are sorted by (predV.id,
-/// succV.id) for deterministic processing order.
+/// VECTOR_ONLY blocks. A candidate block must have tensor results, exactly one
+/// CUBE predecessor and exactly one CUBE successor. Edges are sorted by
+/// (predV.id, succV.id) for deterministic processing order.
 static SmallVector<std::pair<ComputeBlock *, ComputeBlock *>>
 collectVectorMergeEdges(
     const DenseMap<int, std::unique_ptr<ComputeBlock>> &computeBlocks) {
-  auto hasCubeNeighbor = [](const auto &neighbors) {
-    return llvm::any_of(neighbors, [](const ComputeBlock *nb) {
+  auto countCubeNeighbors = [](const auto &neighbors) {
+    return llvm::count_if(neighbors, [](const ComputeBlock *nb) {
       return nb->coreType == CVPipeline::CoreType::CUBE_ONLY;
     });
   };
@@ -298,8 +299,9 @@ collectVectorMergeEdges(
     if (!hasTensorResult(blk))
       continue;
 
-    // Must have both a CUBE predecessor and a CUBE successor
-    if (!hasCubeNeighbor(blk.succs) || !hasCubeNeighbor(blk.preds))
+    // Must have exactly one CUBE predecessor and exactly one CUBE successor
+    if (countCubeNeighbors(blk.succs) != 1 ||
+        countCubeNeighbors(blk.preds) != 1)
       continue;
 
     vecCandidates.insert(&blk);
@@ -360,21 +362,18 @@ collectDepOpsInCubePre(const ComputeBlock &cubePre,
 /// the clone. Returns false (without cloning) if any prerequisite along the
 /// way is missing.
 static bool
-tryCloneFromCubePre(const ComputeBlock &succV,
+tryCloneFromCubePre(const ComputeBlock &predV, const ComputeBlock &succV,
                     const CVPipeline::MemoryDependenceGraph &memGraph,
                     CVPipeline::ComputeBlockIdManager &bm,
                     CrossCubeCloneRecord &record) {
   // a. Find succV's CUBE predecessor (Cube)
-  ComputeBlock *cube = findCubePred(succV);
-  if (!cube) {
-    LOG_DEBUG("succV " << succV.id << " has no CUBE predecessor");
-    return false;
-  }
-
-  // b. Find Cube's CUBE predecessor (CubePre)
-  ComputeBlock *cubePre = findCubePred(*cube);
-  if (!cubePre) {
-    LOG_DEBUG("Cube " << cube->id << " has no CUBE predecessor");
+  ComputeBlock *cube = findCubeNeighbor(succV.preds);
+  // b. Find predV's CUBE successor (CubePre) and require the edge
+  // CubePre → Cube, i.e. Cube depends on CubePre.
+  ComputeBlock *cubePre = findCubeNeighbor(predV.succs);
+  if (!cube || !cubePre || !cube->preds.contains(cubePre)) {
+    LOG_DEBUG("succV or predV has no CUBE successor, or no edge "
+              << "between them, skipping clone");
     return false;
   }
 
@@ -406,7 +405,7 @@ tryCrossCubeCloneMerge(const ComputeBlock &predV, const ComputeBlock &succV,
                        const CVPipeline::MemoryDependenceGraph &memGraph,
                        CVPipeline::ComputeBlockIdManager &bm) {
   CrossCubeCloneRecord cloneRecord;
-  bool cloned = tryCloneFromCubePre(succV, memGraph, bm, cloneRecord);
+  bool cloned = tryCloneFromCubePre(predV, succV, memGraph, bm, cloneRecord);
 
   // Check cycle (with the clone applied, if any); roll back the clone
   // on failure.
