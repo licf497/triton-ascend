@@ -266,30 +266,33 @@ static void cloneOpCrossCubeDep(
   }
 }
 
-/// Return the first CUBE_ONLY block among the given predecessor/successor
-/// neighbors, or nullptr if none exists.
+/// Return the only CUBE_ONLY block among the given predecessor/successor
+/// neighbors, or nullptr if there is not exactly one such block.
 static ComputeBlock *
-findCubeNeighbor(const DenseSet<ComputeBlock *> &neighbors) {
+findOnlyCubeNeighbour(const DenseSet<ComputeBlock *> &neighbors) {
+  ComputeBlock *result = nullptr;
   for (ComputeBlock *nb : neighbors) {
-    if (nb->coreType == CVPipeline::CoreType::CUBE_ONLY)
-      return nb;
+    if (nb->coreType != CVPipeline::CoreType::CUBE_ONLY)
+      continue;
+    if (result)
+      return nullptr;
+    result = nb;
   }
-  return nullptr;
+  return result;
 }
+
+/// A merge candidate edge between two adjacent VECTOR_ONLY blocks.
+struct VectorMergeEdge {
+  ComputeBlock *predV;
+  ComputeBlock *succV;
+};
 
 /// Step 2: Collect merge candidate edges (predV → succV) between
 /// VECTOR_ONLY blocks. A candidate block must have tensor results, exactly one
 /// CUBE predecessor and exactly one CUBE successor. Edges are sorted by
 /// (predV.id, succV.id) for deterministic processing order.
-static SmallVector<std::pair<ComputeBlock *, ComputeBlock *>>
-collectVectorMergeEdges(
+static SmallVector<VectorMergeEdge> collectVectorMergeEdges(
     const DenseMap<int, std::unique_ptr<ComputeBlock>> &computeBlocks) {
-  auto countCubeNeighbors = [](const auto &neighbors) {
-    return llvm::count_if(neighbors, [](const ComputeBlock *nb) {
-      return nb->coreType == CVPipeline::CoreType::CUBE_ONLY;
-    });
-  };
-
   // Collect VECTOR_ONLY candidate blocks
   DenseSet<ComputeBlock *> vecCandidates;
   for (auto &kv : computeBlocks) {
@@ -300,28 +303,26 @@ collectVectorMergeEdges(
       continue;
 
     // Must have exactly one CUBE predecessor and exactly one CUBE successor
-    if (countCubeNeighbors(blk.succs) != 1 ||
-        countCubeNeighbors(blk.preds) != 1)
+    if (!findOnlyCubeNeighbour(blk.succs) || !findOnlyCubeNeighbour(blk.preds))
       continue;
 
     vecCandidates.insert(&blk);
   }
 
   // Collect ALL adjacent edges between candidates as merge candidates
-  SmallVector<std::pair<ComputeBlock *, ComputeBlock *>> edges;
+  SmallVector<VectorMergeEdge> edges;
   for (ComputeBlock *cand : vecCandidates) {
     for (ComputeBlock *succ : cand->succs) {
       if (vecCandidates.contains(succ)) {
-        edges.emplace_back(cand, succ);
+        edges.emplace_back(VectorMergeEdge{cand, succ});
       }
     }
   }
-  llvm::sort(edges, [](const std::pair<ComputeBlock *, ComputeBlock *> &a,
-                       const std::pair<ComputeBlock *, ComputeBlock *> &b) {
-    if (a.first->id != b.first->id) {
-      return a.first->id < b.first->id;
+  llvm::sort(edges, [](const VectorMergeEdge &a, const VectorMergeEdge &b) {
+    if (a.predV->id != b.predV->id) {
+      return a.predV->id < b.predV->id;
     }
-    return a.second->id < b.second->id;
+    return a.succV->id < b.succV->id;
   });
   if (edges.empty()) {
     LOG_DEBUG("No adjacent VECTOR edge found, skipping");
@@ -362,15 +363,15 @@ collectDepOpsInCubePre(const ComputeBlock &cubePre,
 /// the clone. Returns false (without cloning) if any prerequisite along the
 /// way is missing.
 static bool
-tryCloneFromCubePre(const ComputeBlock &predV, const ComputeBlock &succV,
+tryCloneFromCubePre(const VectorMergeEdge &edge,
                     const CVPipeline::MemoryDependenceGraph &memGraph,
                     CVPipeline::ComputeBlockIdManager &bm,
                     CrossCubeCloneRecord &record) {
   // a. Find succV's CUBE predecessor (Cube)
-  ComputeBlock *cube = findCubeNeighbor(succV.preds);
+  ComputeBlock *cube = findOnlyCubeNeighbour(edge.succV->preds);
   // b. Find predV's CUBE successor (CubePre) and require the edge
   // CubePre → Cube, i.e. Cube depends on CubePre.
-  ComputeBlock *cubePre = findCubeNeighbor(predV.succs);
+  ComputeBlock *cubePre = findOnlyCubeNeighbour(edge.predV->succs);
   if (!cube || !cubePre || !cube->preds.contains(cubePre)) {
     LOG_DEBUG("succV or predV has no CUBE successor, or no edge "
               << "between them, skipping clone");
@@ -401,11 +402,13 @@ tryCloneFromCubePre(const ComputeBlock &predV, const ComputeBlock &succV,
 /// Step 3: Try to merge succV into predV.
 /// Returns true if merge succeeded.
 static bool
-tryCrossCubeCloneMerge(const ComputeBlock &predV, const ComputeBlock &succV,
+tryCrossCubeCloneMerge(const VectorMergeEdge &edge,
                        const CVPipeline::MemoryDependenceGraph &memGraph,
                        CVPipeline::ComputeBlockIdManager &bm) {
+  const ComputeBlock &predV = *edge.predV;
+  const ComputeBlock &succV = *edge.succV;
   CrossCubeCloneRecord cloneRecord;
-  bool cloned = tryCloneFromCubePre(predV, succV, memGraph, bm, cloneRecord);
+  bool cloned = tryCloneFromCubePre(edge, memGraph, bm, cloneRecord);
 
   // Check cycle (with the clone applied, if any); roll back the clone
   // on failure.
@@ -438,30 +441,28 @@ static bool tryMergeInBlock(Block *mainLoop,
     return anyMerged;
 
   // Step 2: Collect merge candidate edges between VECTOR blocks
-  SmallVector<std::pair<ComputeBlock *, ComputeBlock *>> edgeCandidates =
+  SmallVector<VectorMergeEdge> edgeCandidates =
       collectVectorMergeEdges(computeBlocks);
 
   while (!edgeCandidates.empty()) {
     // Pop the next VECTOR pair to process from the candidate set.
-    std::pair<ComputeBlock *, ComputeBlock *> edge =
-        edgeCandidates.pop_back_val();
-    ComputeBlock *predV = edge.first;
-    ComputeBlock *succV = edge.second;
+    VectorMergeEdge edge = edgeCandidates.pop_back_val();
+    ComputeBlock *predV = edge.predV;
+    ComputeBlock *succV = edge.succV;
 
     LOG_DEBUG("Trying VECTOR edge: predV=" << predV->id
                                            << ", succV=" << succV->id);
 
     // Step 3: Try to merge
-    bool merged = tryCrossCubeCloneMerge(*predV, *succV, memGraph, bm);
+    bool merged = tryCrossCubeCloneMerge(edge, memGraph, bm);
     if (merged) {
       anyMerged = true;
       // Remove all remaining edges touching the merged blocks: they can
       // no longer participate in further merges.
-      llvm::erase_if(edgeCandidates,
-                     [&](const std::pair<ComputeBlock *, ComputeBlock *> &e) {
-                       return e.first == predV || e.second == predV ||
-                              e.first == succV || e.second == succV;
-                     });
+      llvm::erase_if(edgeCandidates, [&](const VectorMergeEdge &e) {
+        return e.predV == predV || e.succV == predV || e.predV == succV ||
+               e.succV == succV;
+      });
     }
   }
   return anyMerged;
