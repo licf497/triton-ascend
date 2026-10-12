@@ -285,4 +285,27 @@ module {
     }
     return
   }
+
+  // ============================================
+  // Test 10: Producer is a block argument (function arg / gm arg) → still
+  // unify data/dest view ops into the store's block_id.
+  // ============================================
+  // CHECK-LABEL: func @test_block_argument_producer
+  func.func @test_block_argument_producer(%arg0: memref<?xf16> {tt.divisibility = 16 : i32}, %in: tensor<64x64xf16>) {
+    // %c0 feeds reinterpret_cast's offset (scalar dep), unified to 7.
+    // CHECK: arith.constant {ssbuffer.block_id = 7 : i32, ssbuffer.core_type = "VECTOR"} 0 : index
+    %c0 = arith.constant {ssbuffer.block_id = 8 : i32, ssbuffer.core_type = "VECTOR"} 0 : index
+    // data view (source is the block argument %in) unified to 7.
+    // CHECK: tensor.extract_slice %{{.*}} {ssbuffer.block_id = 7 : i32, ssbuffer.core_type = "VECTOR"} : tensor<64x64xf16> to tensor<64x64xf16>
+    %extract = tensor.extract_slice %in[0, 0] [64, 64] [1, 1] {ssbuffer.block_id = 8 : i32, ssbuffer.core_type = "VECTOR"} : tensor<64x64xf16> to tensor<64x64xf16>
+    // dest view unified to 7.
+    // CHECK: memref.reinterpret_cast %{{.*}} {ssbuffer.block_id = 7 : i32, ssbuffer.core_type = "VECTOR"} : memref<?xf16> to memref<128x64xf16, strided<[64, 1], offset: ?>>
+    %reinterpret = memref.reinterpret_cast %arg0 to offset: [%c0], sizes: [128, 64], strides: [64, 1] {ssbuffer.block_id = 8 : i32, ssbuffer.core_type = "VECTOR"} : memref<?xf16> to memref<128x64xf16, strided<[64, 1], offset: ?>>
+    // CHECK: memref.subview %{{.*}} {ssbuffer.block_id = 7 : i32, ssbuffer.core_type = "VECTOR"} : memref<128x64xf16, strided<[64, 1], offset: ?>> to memref<64x64xf16, strided<[64, 1], offset: ?>>
+    %subview = memref.subview %reinterpret[0, 0] [64, 64] [1, 1] {ssbuffer.block_id = 8 : i32, ssbuffer.core_type = "VECTOR"} : memref<128x64xf16, strided<[64, 1], offset: ?>> to memref<64x64xf16, strided<[64, 1], offset: ?>>
+    // store stays at block 7 (target).
+    // CHECK: bufferization.materialize_in_destination %{{.*}} {ssbuffer.block_id = 7 : i32, ssbuffer.core_type = "VECTOR"} : (tensor<64x64xf16>, memref<64x64xf16, strided<[64, 1], offset: ?>>) -> ()
+    bufferization.materialize_in_destination %extract in writable %subview {ssbuffer.block_id = 7 : i32, ssbuffer.core_type = "VECTOR"} : (tensor<64x64xf16>, memref<64x64xf16, strided<[64, 1], offset: ?>>) -> ()
+    return
+  }
 }

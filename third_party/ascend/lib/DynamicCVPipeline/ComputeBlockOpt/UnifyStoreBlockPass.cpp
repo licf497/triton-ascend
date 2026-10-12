@@ -94,7 +94,9 @@ static Value getViewSourceValue(Operation *viewOp) {
 }
 
 static Operation *traceProducerOp(Operation *storeOp,
-                                  SmallVector<Operation *> &dataViewOps) {
+                                  SmallVector<Operation *> &dataViewOps,
+                                  bool &sourceIsBlockArgument) {
+  sourceIsBlockArgument = false;
   Value cur = getStoreSource(storeOp);
   while (Operation *defOp = cur.getDefiningOp()) {
     // view-like op (incl. tensor.extract_slice): transparent, pierce through
@@ -117,8 +119,13 @@ static Operation *traceProducerOp(Operation *storeOp,
     LOG_DEBUG("Find producer op: " << *defOp);
     return defOp;
   }
-  LOG_DEBUG("Could not find producer op!");
-  return nullptr; // reached a block argument (iter_arg / gm arg)
+  // Reached a block argument (iter_arg / gm arg): there is no real producer
+  // op, but the view chain collected so far is still valid and should be
+  // unified into the store's block_id.
+  sourceIsBlockArgument = true;
+  LOG_DEBUG(
+      "Produce source is a block argument, unify view ops to store block!");
+  return nullptr;
 }
 
 /**
@@ -229,9 +236,11 @@ collectOpsToUnify(Operation *storeOp,
  *
  * @return true if the pattern is matched and ready for apply, false to skip.
  *
- * @note producer is inserted as the first element of @p matchedOps (required
- *       by cloneScalarOpsForCrossBlockUses to identify the target block),
- *       followed by the store op, view ops, and scalar dependencies.
+ * @note The target op is inserted as the first element of @p matchedOps
+ *       (required by cloneScalarOpsForCrossBlockUses to identify the target
+ *       block): the producer when one is found, otherwise the store op (when
+ *       the source traces back to a block argument). The store op, view ops,
+ *       and scalar dependencies follow.
  */
 static bool matchStorePattern(Operation *storeOp,
                               CVPipeline::ComputeBlockIdManager &bm,
@@ -246,22 +255,29 @@ static bool matchStorePattern(Operation *storeOp,
   // Step 1: trace producer op from store.source, skipping views + scalars,
   //         and collect all viewops in the data chain.
   SmallVector<Operation *> dataViewOps;
-  Operation *producer = traceProducerOp(storeOp, dataViewOps);
-  if (!producer) {
-    return false; // block argument / fully-scalar chain / core_type mismatch ->
-                  // skip
+  bool sourceIsBlockArgument = false;
+  Operation *producer =
+      traceProducerOp(storeOp, dataViewOps, sourceIsBlockArgument);
+  if (!producer && !sourceIsBlockArgument) {
+    return false; // fully-scalar chain / core_type mismatch -> skip
   }
 
-  if (bm.getBlockIdByOp(producer) == -1 ||
-      producer->getBlock() != storeOp->getBlock()) {
-    LOG_DEBUG("ProducerOp has no block_id or not in the same block as storeOp, "
-              "cannot unify! ");
-    return false; // producer has no block_id, cannot unify
+  if (producer) {
+    if (bm.getBlockIdByOp(producer) == -1 ||
+        producer->getBlock() != storeOp->getBlock()) {
+      LOG_DEBUG("ProducerOp has no block_id or not in the same block as "
+                "storeOp, cannot unify! ");
+      return false; // producer has no block_id, cannot unify
+    }
+    // producer first is required by cloneScalarOpsForCrossBlockUses to identify
+    // the target block.
+    matchedOps.insert(producer);
   }
+  // When the source is a block argument (iter_arg / gm arg), there is no
+  // producer op to anchor the target block; collectOpsToUnify pushes storeOp
+  // first, so matchedOps[0] is the store and its block_id becomes the target.
 
-  // Step 2: build matchedOps = {producer} + {store} + viewOps + scalarDeps.
-  //         producer first is required by cloneScalarOpsForCrossBlockUses.
-  matchedOps.insert(producer);
+  // Step 2: build matchedOps = {producer?} + {store} + viewOps + scalarDeps.
   SmallVector<Operation *> opsToUnify =
       collectOpsToUnify(storeOp, dataViewOps, bm);
   matchedOps.insert(opsToUnify.begin(), opsToUnify.end());
@@ -276,13 +292,13 @@ static bool matchStorePattern(Operation *storeOp,
 static bool applyStoreUnify(const SetVector<Operation *> &matchedOps,
                             const CVPipeline::MemoryDependenceGraph &memGraph,
                             CVPipeline::ComputeBlockIdManager &bm) {
-  Operation *producer = matchedOps[0];
-  int targetBlockId = bm.getBlockIdByOp(producer);
+  Operation *targetOp = matchedOps[0];
+  int targetBlockId = bm.getBlockIdByOp(targetOp);
 
   SmallVector<Operation *> opsToUnifyList(matchedOps.begin(), matchedOps.end());
   if (CVPipeline::willCreateCycle(opsToUnifyList, memGraph, targetBlockId,
                                   bm)) {
-    LOG_DEBUG("Cycle detected, cannot unify storeOp to producer!\n");
+    LOG_DEBUG("Cycle detected, cannot unify storeOp to target block!\n");
     return false;
   }
 
@@ -342,7 +358,7 @@ public:
         //            B -> C
         //          Now we want to fuse D to A, so clone C' scalarOps for
         //          D dependencies to avoid cycle.
-        LOG_DEBUG("Producer op = " << *matchedOps[0]);
+        LOG_DEBUG("Target op = " << *matchedOps[0]);
         CVPipeline::cloneScalarOpsForCrossBlockUses(
             bm, matchedOps, bm.getBlockIdByOp(matchedOps[0]));
         // Phase 3: for each pattern, cycle detection + block_id update.
